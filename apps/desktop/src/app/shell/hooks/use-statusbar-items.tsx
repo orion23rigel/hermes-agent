@@ -8,6 +8,7 @@ import { ContextUsagePanel } from '@/app/shell/context-usage-panel'
 import { GatewayMenuPanel } from '@/app/shell/gateway-menu-panel'
 import { Codicon } from '@/components/ui/codicon'
 import { GlyphSpinner } from '@/components/ui/glyph-spinner'
+import { TooltipDetails } from '@/components/ui/tooltip'
 import { useI18n } from '@/i18n'
 import { Activity, AlertCircle, Clock, Command, FolderOpen, Globe, Hash, Loader2, Terminal } from '@/lib/icons'
 import type { RuntimeReadinessResult } from '@/lib/runtime-readiness'
@@ -233,15 +234,27 @@ export function useStatusbarItems({
       ? `${base} · ${updateApply.stage === 'restart' ? copy.restart : copy.update}`
       : `${base}${behindHint}`
 
-    const tooltip = [
+    const tooltipPrimary = appVersion ? copy.desktopVersion(appVersion) : (sha ? copy.commit(sha) : null)
+    const tooltipDetails = [
       applying ? updateApply.message || copy.updateInProgress : null,
       !applying && behind > 0 && copy.commitsBehind(behind, branch ?? '...'),
-      appVersion && copy.desktopVersion(appVersion),
-      sha && copy.commit(sha),
+      appVersion && sha && copy.commit(sha),
       branch && copy.branch(branch)
     ]
-      .filter(Boolean)
-      .join('\n')
+      .filter((detail): detail is string => Boolean(detail))
+
+    const tooltip = tooltipPrimary ? (
+      <>
+        <span>{tooltipPrimary}</span>
+        {tooltipDetails.length > 0 && (
+          <TooltipDetails className="flex flex-col gap-0.5">
+            {tooltipDetails.map(detail => (
+              <span key={detail}>{detail}</span>
+            ))}
+          </TooltipDetails>
+        )}
+      </>
+    ) : undefined
 
     return {
       className: !applying && behind > 0 ? 'text-primary hover:text-primary' : undefined,
@@ -253,7 +266,7 @@ export function useStatusbarItems({
       // their client is behind. Listed in the menu, but locked on.
       lockedVisible: true,
       onSelect: () => openUpdateOverlayFor('client'),
-      title: tooltip || undefined,
+      title: tooltip,
       toggleLabel: copy.toggleVersion,
       variant: 'action'
     }
@@ -290,14 +303,25 @@ export function useStatusbarItems({
       ? `${base} · ${backendUpdateApply.stage === 'restart' ? copy.restart : copy.update}`
       : `${base}${behindHint}`
 
-    const tooltip = [
+    const tooltipDetails = [
       applying ? backendUpdateApply.message || copy.updateInProgress : null,
       !applying && behind > 0 && copy.commitsBehind(behind, 'main'),
-      !applying && behind <= 0 && updateAvailable && copy.update,
-      backendVersion && copy.backendVersion(backendVersion)
+      !applying && behind <= 0 && updateAvailable && copy.update
     ]
-      .filter(Boolean)
-      .join('\n')
+      .filter((detail): detail is string => Boolean(detail))
+
+    const tooltip = backendVersion ? (
+      <>
+        <span>{copy.backendVersion(backendVersion)}</span>
+        {tooltipDetails.length > 0 && (
+          <TooltipDetails className="flex flex-col gap-0.5">
+            {tooltipDetails.map(detail => (
+              <span key={detail}>{detail}</span>
+            ))}
+          </TooltipDetails>
+        )}
+      </>
+    ) : undefined
 
     return {
       className: !applying && updateAvailable ? 'text-primary hover:text-primary' : undefined,
@@ -307,7 +331,7 @@ export function useStatusbarItems({
       label,
       lockedVisible: true,
       onSelect: () => openUpdateOverlayFor('backend'),
-      title: tooltip || undefined,
+      title: tooltip,
       toggleLabel: copy.toggleBackendVersion,
       variant: 'action'
     }
