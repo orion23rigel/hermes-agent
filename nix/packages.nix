@@ -9,6 +9,33 @@
       ...
     }:
     let
+      sandbox = pkgs.writeShellApplication {
+        name = "sandbox";
+        runtimeInputs = with pkgs; [
+          bash
+          bubblewrap
+          cacert
+          coreutils
+          curl
+          gawk
+          git
+          glibc.bin
+          gnugrep
+          gnused
+          gzip
+          netcat-gnu
+          openssl
+          python3
+          slirp4netns
+          gnutar
+        ];
+        text = ''
+          export DEV_SANDBOX_REAL_CA_CERT=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt
+          export DEV_SANDBOX_DYNAMIC_LINKER=${pkgs.stdenv.cc.bintools.dynamicLinker}
+          exec ${../scripts/dev-sandbox.sh} "$@"
+        '';
+      };
+
       minimal = pkgs.callPackage ./hermes-agent.nix {
         inherit (inputs) uv2nix pyproject-nix pyproject-build-systems;
         npm-lockfile-fix = inputs'.npm-lockfile-fix.packages.default;
@@ -45,6 +72,8 @@
     {
       packages = {
         default = full;
+
+        inherit sandbox;
 
         inherit minimal;
 
