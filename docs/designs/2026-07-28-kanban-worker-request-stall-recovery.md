@@ -3,7 +3,8 @@ proposal_id: prop:756ea35adb0982bbb5d028b24d53be31e1e8d9fa
 spec_hash: e50f9e709914aad916532811d43f274069c4e2e6c7b9e63652676b384d644541
 repo_name: hermes-agent
 feature_slug: kanban-worker-request-stall-recovery
-status: awaiting_approval
+status: queued
+kanban_task_id: t_c2657ee3
 origin_interface: discord
 hermes_thread_id: 1531747310298730677
 builds_thread_id: 1531747318821421226
