@@ -12,6 +12,8 @@ export function VersionDetails({ version }: { version: DesktopVersionInfo }) {
   const { t } = useI18n()
   const u = t.updates
   const unknownDistance = version.dirty && version.distance == null
+  const source = version.source === 'ci' ? 'CI' : version.source ? version.source[0].toUpperCase() + version.source.slice(1) : null
+  const distribution = version.distribution === 'nix' ? 'Nix' : version.distribution === 'docker' ? 'Docker' : null
 
   return (
     <dl className="grid gap-2 rounded-lg border border-border/70 bg-muted/20 px-3 py-3 text-sm">
@@ -38,6 +40,18 @@ export function VersionDetails({ version }: { version: DesktopVersionInfo }) {
           >
             {version.commit.slice(0, 14)}
           </ExternalLink>
+        </div>
+      )}
+      {source && (
+        <div className="flex justify-between gap-4">
+          <dt className="text-muted-foreground">{u.versionDetailsSource}</dt>
+          <dd>{source}</dd>
+        </div>
+      )}
+      {distribution && (
+        <div className="flex justify-between gap-4">
+          <dt className="text-muted-foreground">{u.versionDetailsDistribution}</dt>
+          <dd>{distribution}</dd>
         </div>
       )}
       {version.dirty && (

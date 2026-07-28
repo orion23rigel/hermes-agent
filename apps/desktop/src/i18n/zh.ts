@@ -2325,6 +2325,8 @@ export const zh: Translations = {
     versionDetailsBranch: '分支',
     versionDetailsNoBranchInfo: '无分支信息',
     versionDetailsCommit: '提交',
+    versionDetailsSource: '来源',
+    versionDetailsDistribution: '发行方式',
     versionDetailsDirty: '此软件包从有未提交更改的源代码树构建。',
     versionDetailsDirtyUnknown: '从有未提交更改的源代码树构建。自上次发布以来的更改数量未知。',
     connectionRetry: '请检查网络连接后重试。',

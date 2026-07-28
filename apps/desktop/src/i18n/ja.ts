@@ -1994,6 +1994,8 @@ export const ja = defineLocale({
     versionDetailsBranch: 'ブランチ',
     versionDetailsNoBranchInfo: 'ブランチ情報なし',
     versionDetailsCommit: 'コミット',
+    versionDetailsSource: 'ソース',
+    versionDetailsDistribution: '配布形式',
     versionDetailsDirty: 'このパッケージは変更のあるソースツリーからビルドされました。',
     versionDetailsDirtyUnknown: '変更のあるソースツリーからビルドされました。最後のリリースからの変更数は不明です。',
     connectionRetry: '接続を確認してもう一度試してください。',

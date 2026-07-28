@@ -1934,6 +1934,8 @@ export const zhHant = defineLocale({
     versionDetailsBranch: '分支',
     versionDetailsNoBranchInfo: '沒有分支資訊',
     versionDetailsCommit: '提交',
+    versionDetailsSource: '來源',
+    versionDetailsDistribution: '發行方式',
     versionDetailsDirty: '此套件從有未提交變更的來源樹建置。',
     versionDetailsDirtyUnknown: '從有未提交變更的來源樹建置。自上次發布以來的變更數量未知。',
     connectionRetry: '請檢查網路連線後重試。',

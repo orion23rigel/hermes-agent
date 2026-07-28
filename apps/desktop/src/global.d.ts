@@ -328,7 +328,7 @@ export interface DesktopVersionInfo {
   nodeVersion: string
   platform: string
   hermesRoot: string
-  installMethod?: string
+  distribution?: 'docker' | 'nix'
   source?: 'build' | 'ci' | 'docker' | 'fallback' | 'git' | 'local' | 'nix' | 'unknown'
 }
 

@@ -4486,6 +4486,7 @@ def _session_info(agent, session: dict | None = None) -> dict:
         info["version_commit"] = version_info.commit or ""
         info["version_branch"] = version_info.branch or ""
         info["version_source"] = version_info.source
+        info["version_distribution"] = version_info.distribution or ""
         info["version_dirty"] = version_info.dirty
     except Exception:
         pass

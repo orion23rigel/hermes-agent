@@ -19,7 +19,7 @@ import os
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Literal, cast
 
 from hermes_cli import __release_date__, __version__
 
@@ -31,9 +31,10 @@ class VersionInfo:
     distance: int | None
     commit: str | None
     branch: str | None
-    source: Literal["git", "nix", "docker", "build", "unknown"]
+    source: Literal["build", "ci", "docker", "fallback", "git", "local", "nix", "unknown"]
     dirty: bool = False
     commit_date: int | None = None
+    distribution: Literal["docker", "nix"] | None = None
 
 
 def format_display_version(info: VersionInfo | None = None) -> str:
@@ -125,18 +126,17 @@ def _stamp_version_info() -> VersionInfo | None:
     if isinstance(distance, str):
         distance = _parse_nonnegative(distance)
 
-    # Normalize source labels — the stamp's "source" field describes the
-    # build environment (ci/local/docker/nix/fallback), not the runtime
-    # provenance path. Map known packaged sources to their runtime label.
+    # ``source`` describes build provenance, while ``distribution`` identifies
+    # the package form users installed. Keep both facts intact for support.
     stamp_source = str(data.get("source") or "")
-    if stamp_source in ("docker", "nix"):
-        source: Literal["git", "nix", "docker", "build", "unknown"] = stamp_source
-    elif stamp_source in ("ci", "local"):
-        # CI/local stamps are still git-based provenance — the commit was
-        # resolved from git at build time and baked into the stamp.
-        source = "git"
-    else:
-        source = "build"
+    source = (
+        cast(Literal["build", "ci", "docker", "fallback", "git", "local", "nix", "unknown"], stamp_source)
+        if stamp_source in {"ci", "docker", "fallback", "local", "nix"}
+        else "build"
+    )
+    distribution = data.get("distribution")
+    if distribution not in {"docker", "nix"}:
+        distribution = None
 
     commit_date = data.get("commitDate")
     if not isinstance(commit_date, int):
@@ -151,6 +151,7 @@ def _stamp_version_info() -> VersionInfo | None:
         source,
         bool(data.get("dirty")),
         commit_date,
+        distribution,
     )
 
 
@@ -236,4 +237,6 @@ def format_version_details(info: VersionInfo | None = None) -> str:
     if info.commit:
         values.append(f"commit {info.commit}")
     values.append(f"source {info.source}")
+    if info.distribution:
+        values.append(f"distribution {info.distribution}")
     return " · ".join(values)

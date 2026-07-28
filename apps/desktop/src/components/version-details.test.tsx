@@ -38,4 +38,28 @@ describe('VersionDetails', () => {
     expect(screen.getByText('unknown')).toBeTruthy()
     expect(screen.queryByText('No branch information')).toBeNull()
   })
+
+  it('shows the Nix source and distribution from the stamp', () => {
+    render(
+      <I18nProvider configClient={null} initialLocale="en">
+        <VersionDetails version={{ ...baseVersion, source: 'nix', distribution: 'nix' }} />
+      </I18nProvider>
+    )
+
+    expect(screen.getByText('Source')).toBeTruthy()
+    expect(screen.getAllByText('Nix')).toHaveLength(2)
+    expect(screen.getByText('Distribution')).toBeTruthy()
+  })
+
+  it('distinguishes CI provenance from the Docker distribution', () => {
+    render(
+      <I18nProvider configClient={null} initialLocale="en">
+        <VersionDetails version={{ ...baseVersion, source: 'ci', distribution: 'docker' }} />
+      </I18nProvider>
+    )
+
+    expect(screen.getByText('CI')).toBeTruthy()
+    expect(screen.getByText('Distribution')).toBeTruthy()
+    expect(screen.getByText('Docker')).toBeTruthy()
+  })
 })

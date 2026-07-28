@@ -440,7 +440,7 @@ const SOURCE_REPO_ROOT = path.resolve(APP_ROOT, '../..')
 // Schema:
 //   schema 1: { commit, branch, builtAt, dirty, source }
 //   schema 2 adds immutable-package provenance: baseVersion, displayVersion,
-//   distance, and installMethod.
+//   distance, and distribution.
 const INSTALL_STAMP_SCHEMA_VERSION = 2
 
 function loadInstallStamp() {
@@ -474,7 +474,7 @@ function loadInstallStamp() {
           baseVersion: typeof parsed.baseVersion === 'string' ? parsed.baseVersion : null,
           displayVersion: typeof parsed.displayVersion === 'string' ? parsed.displayVersion : null,
           distance: typeof parsed.distance === 'number' && parsed.distance >= 0 ? parsed.distance : null,
-          installMethod: typeof parsed.installMethod === 'string' ? parsed.installMethod : null,
+          distribution: typeof parsed.distribution === 'string' ? parsed.distribution : null,
           builtAt: parsed.builtAt || null,
           dirty: Boolean(parsed.dirty),
           source: parsed.source || null,
@@ -11071,7 +11071,7 @@ function resolveHermesVersionInfo() {
       commit: INSTALL_STAMP.commit,
       branch: INSTALL_STAMP.branch,
       source: INSTALL_STAMP.source ?? undefined,
-      installMethod: INSTALL_STAMP.installMethod ?? undefined,
+      distribution: INSTALL_STAMP.distribution ?? undefined,
       dirty: INSTALL_STAMP.dirty
     }
   }

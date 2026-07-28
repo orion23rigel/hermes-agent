@@ -37,6 +37,7 @@ def test_stamp_version_info_reads_nix_stamp(tmp_path, monkeypatch):
         "distance": 3,
         "dirty": False,
         "source": "nix",
+        "distribution": "nix",
     }
     stamp_file = tmp_path / ".hermes_build_info.json"
     stamp_file.write_text(json.dumps(stamp))
@@ -44,7 +45,33 @@ def test_stamp_version_info_reads_nix_stamp(tmp_path, monkeypatch):
 
     info = get_version_info()
 
-    assert info == VersionInfo("0.19.0", "0.19.0+3", 3, "a" * 40, "feature/version", "nix")
+    assert info == VersionInfo("0.19.0", "0.19.0+3", 3, "a" * 40, "feature/version", "nix", distribution="nix")
+
+
+def test_stamp_version_info_preserves_ci_provenance_and_docker_distribution(tmp_path, monkeypatch):
+    stamp = {"commit": "d" * 40, "source": "ci", "distribution": "docker"}
+    stamp_file = tmp_path / ".hermes_build_info.json"
+    stamp_file.write_text(json.dumps(stamp))
+    monkeypatch.setattr("hermes_cli.version_info._resolve_stamp_file", lambda: stamp_file)
+
+    info = get_version_info()
+
+    assert info.source == "ci"
+    assert info.distribution == "docker"
+
+
+def test_version_command_shows_provenance_and_distribution(monkeypatch, capsys):
+    import hermes_cli.main as main
+
+    info = VersionInfo("0.19.0", "0.19.0", None, "a" * 40, "main", "ci", distribution="docker")
+    monkeypatch.setattr("hermes_cli.banner.format_banner_version_label", lambda: "Hermes Agent v0.19.0")
+    monkeypatch.setattr("hermes_cli.version_info.get_version_info", lambda: info)
+
+    main._print_version_info(check_updates=False)
+
+    output = capsys.readouterr().out
+    assert "Source: ci" in output
+    assert "Distribution: docker" in output
 
 
 def test_stamp_version_info_preserves_missing_branch(tmp_path, monkeypatch):

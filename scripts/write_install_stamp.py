@@ -13,11 +13,11 @@ Usage::
     # Override provenance for reproducible/packaged builds:
     python scripts/write_install_stamp.py --output ... \\
         --commit <sha> --branch <name> --dirty \\
-        --base-version 0.19.0 --distance 42 --source nix
+        --base-version 0.19.0 --distance 42 --source nix --distribution nix
 
     # Docker (no .git, commit known from build arg):
     python scripts/write_install_stamp.py --output /opt/hermes/.hermes_build_info.json \\
-        --commit ${HERMES_GIT_SHA} --source docker
+        --commit ${HERMES_GIT_SHA} --source ci --distribution docker
 """
 
 from __future__ import annotations
@@ -126,6 +126,7 @@ def build_stamp(
     distance: int | None = None,
     commit_date: int | None = None,
     source: str = "local",
+    distribution: str | None = None,
 ) -> dict:
     """Build a stamp dict from explicit args, filling gaps from git/env.
 
@@ -181,6 +182,7 @@ def build_stamp(
         "builtAt": datetime.now(timezone.utc).isoformat(),
         "dirty": dirty,
         "source": source,
+        "distribution": distribution,
         "baseVersion": base_version,
         "displayVersion": display_version,
         "distance": distance,
@@ -206,6 +208,7 @@ def main() -> int:
     parser.add_argument("--distance", type=int, default=None, help="Override commit distance")
     parser.add_argument("--commit-date", type=int, default=None, help="Override commit timestamp (Unix epoch seconds)")
     parser.add_argument("--source", default="local", help="Stamp source label")
+    parser.add_argument("--distribution", choices=("docker", "nix"), help="Package distribution")
     args = parser.parse_args()
 
     stamp = write_stamp(
@@ -217,6 +220,7 @@ def main() -> int:
         distance=args.distance,
         commit_date=args.commit_date,
         source=args.source,
+        distribution=args.distribution,
     )
 
     commit_short = stamp["commit"][:12]
