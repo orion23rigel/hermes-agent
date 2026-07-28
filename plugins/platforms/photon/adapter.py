@@ -484,14 +484,16 @@ class PhotonAdapter(BasePlatformAdapter):
                 except Exception:
                     pass
         if self._inbound_task is not None:
-            self._inbound_task.cancel()
-            try:
-                await self._inbound_task
-            except asyncio.CancelledError:
-                pass
-            except Exception:
-                pass
+            task = self._inbound_task
             self._inbound_task = None
+            task.cancel()
+            if task is not asyncio.current_task():
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    pass
         await self._stop_sidecar()
         if self._http_client is not None:
             try:
