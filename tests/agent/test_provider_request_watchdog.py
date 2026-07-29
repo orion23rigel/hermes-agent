@@ -136,6 +136,7 @@ def test_monitor_deadline_is_fixed_and_progress_only_counts_bytes():
         "provider_request.progress",
         "provider_request.failed",
     ]
+    assert monitor.terminal_kind == "failed"
 
 
 def test_monitor_new_attempt_gets_fresh_deadline_and_terminal_event_once():
@@ -159,6 +160,7 @@ def test_monitor_new_attempt_gets_fresh_deadline_and_terminal_event_once():
     assert monitor.deadline != first_deadline
     monitor.complete()
     monitor.fail(RuntimeError("late"))
+    assert monitor.terminal_kind == "completed"
 
     assert [name for name, _ in events] == [
         "provider_request.started",
@@ -238,3 +240,45 @@ def test_terminal_transition_after_deadline_becomes_structured_stall(terminal):
         "provider_request.failed",
     ]
     assert events[-1][1]["error_code"] == "provider_request_stalled"
+
+
+def test_explicit_cancellation_wins_over_elapsed_deadline():
+    clock = _Clock()
+    events = []
+    monitor = ProviderRequestMonitor(
+        provider="p",
+        model="m",
+        timeout_seconds=5,
+        clock=clock,
+        event_callback=lambda event, payload: events.append((event, payload)),
+    )
+    monitor.begin_attempt()
+    clock.now += 6
+
+    assert monitor.cancel(InterruptedError("stopped")) is True
+    assert monitor.terminal_kind == "cancelled"
+    assert events[-1][0] == "provider_request.failed"
+    assert events[-1][1]["error_code"] == "InterruptedError"
+
+
+def test_progress_arriving_after_deadline_is_rejected_terminally():
+    clock = _Clock()
+    events = []
+    monitor = ProviderRequestMonitor(
+        provider="p",
+        model="m",
+        timeout_seconds=5,
+        clock=clock,
+        event_callback=lambda event, payload: events.append((event, payload)),
+    )
+    monitor.begin_attempt()
+    monitor.record_progress(3)
+    clock.now += 5
+
+    with pytest.raises(ProviderRequestStalledError) as exc_info:
+        monitor.record_progress(7)
+
+    assert exc_info.value.bytes_received == 3
+    assert events[-1][0] == "provider_request.failed"
+    assert events[-1][1]["bytes_received"] == 3
+    assert monitor.complete() is False

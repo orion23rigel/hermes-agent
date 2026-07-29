@@ -605,6 +605,9 @@ def direct_api_call(agent, api_kwargs: dict):
         if deadline_error["value"] is not None:
             raise deadline_error["value"] from None
         if getattr(agent, "_interrupt_requested", False):
+            request_monitor.cancel(
+                InterruptedError("provider request interrupted")
+            )
             raise InterruptedError("Agent interrupted during API call") from None
         try:
             won_terminal = request_monitor.fail(exc)
@@ -619,6 +622,9 @@ def direct_api_call(agent, api_kwargs: dict):
         if deadline_error["value"] is not None:
             raise deadline_error["value"]
         if getattr(agent, "_interrupt_requested", False):
+            request_monitor.cancel(
+                InterruptedError("provider request interrupted")
+            )
             raise InterruptedError("Agent interrupted during API call")
         _reset_stale_streak(agent)
         won_terminal = request_monitor.complete()
@@ -761,6 +767,19 @@ def interruptible_api_call(agent, api_kwargs: dict):
     )
     retry_count = int(getattr(agent, "_current_api_retry_count", 0) or 0)
     deadline_error: dict[str, ProviderRequestStalledError | None] = {"value": None}
+    request_terminal_lock = threading.RLock()
+
+    def _terminalize_timeout(error: TimeoutError) -> None:
+        """Fence late worker publication when a legacy watchdog fires first."""
+        with request_terminal_lock:
+            try:
+                won_terminal = request_monitor.fail(error)
+            except ProviderRequestStalledError as stall_error:
+                deadline_error["value"] = stall_error
+                result["error"] = stall_error
+            else:
+                if won_terminal or result["error"] is None:
+                    result["error"] = error
 
     def _call():
         try:
@@ -781,8 +800,15 @@ def interruptible_api_call(agent, api_kwargs: dict):
                     kind=kind,
                 ),
             )
-            if request_monitor.complete():
-                result["response"] = response
+            with request_terminal_lock:
+                if agent._interrupt_requested:
+                    _request_cancelled["value"] = True
+                    request_monitor.cancel(
+                        InterruptedError("provider request interrupted")
+                    )
+                    return
+                if request_monitor.complete():
+                    result["response"] = response
         except Exception as e:
             # If the request was cancelled by the main thread's interrupt
             # handler, the transport error is the expected consequence of our
@@ -795,12 +821,17 @@ def interruptible_api_call(agent, api_kwargs: dict):
                     type(e).__name__,
                 )
                 return
-            try:
-                request_monitor.fail(e)
-            except ProviderRequestStalledError as stall_error:
-                result["error"] = stall_error
-            else:
+            if isinstance(e, ProviderRequestStalledError):
                 result["error"] = e
+                return
+            with request_terminal_lock:
+                try:
+                    won_terminal = request_monitor.fail(e)
+                except ProviderRequestStalledError as stall_error:
+                    result["error"] = stall_error
+                else:
+                    if won_terminal:
+                        result["error"] = e
         finally:
             # Reuse reason only on a clean response; any other outcome —
             # error, or the cancel-swallow return above (which leaves both
@@ -949,7 +980,8 @@ def interruptible_api_call(agent, api_kwargs: dict):
         _poll_count += 1
 
         try:
-            request_monitor.check_deadline()
+            with request_terminal_lock:
+                request_monitor.check_deadline()
         except ProviderRequestStalledError as exc:
             deadline_error["value"] = exc
             _request_cancelled["value"] = True
@@ -1039,17 +1071,19 @@ def interruptible_api_call(agent, api_kwargs: dict):
             )
             # Wait briefly for the worker to notice the closed connection.
             t.join(timeout=2.0)
-            if result["error"] is None and result["response"] is None:
-                if _silent_hint:
-                    result["error"] = TimeoutError(
-                        f"Codex stream produced no bytes within {int(_elapsed)}s "
-                        f"(TTFB threshold: {int(_ttfb_timeout)}s). {_silent_hint}"
-                    )
-                else:
-                    result["error"] = TimeoutError(
-                        f"Codex stream produced no bytes within {int(_elapsed)}s "
-                        f"(TTFB threshold: {int(_ttfb_timeout)}s)"
-                    )
+            with request_terminal_lock:
+                if result["error"] is None and result["response"] is None:
+                    if _silent_hint:
+                        result["error"] = TimeoutError(
+                            f"Codex stream produced no bytes within {int(_elapsed)}s "
+                            f"(TTFB threshold: {int(_ttfb_timeout)}s). {_silent_hint}"
+                        )
+                    else:
+                        result["error"] = TimeoutError(
+                            f"Codex stream produced no bytes within {int(_elapsed)}s "
+                            f"(TTFB threshold: {int(_ttfb_timeout)}s)"
+                        )
+                    _terminalize_timeout(result["error"])
             break
 
         # Stream-idle detector: the Codex backend emitted at least one SSE
@@ -1084,11 +1118,13 @@ def interruptible_api_call(agent, api_kwargs: dict):
                 f"codex stream killed after {int(_event_stale_elapsed)}s with no SSE events"
             )
             t.join(timeout=2.0)
-            if result["error"] is None and result["response"] is None:
-                result["error"] = TimeoutError(
-                    f"Codex stream produced no SSE events for {int(_event_stale_elapsed)}s "
-                    f"after first byte (threshold: {int(_codex_idle_timeout)}s)"
-                )
+            with request_terminal_lock:
+                if result["error"] is None and result["response"] is None:
+                    result["error"] = TimeoutError(
+                        f"Codex stream produced no SSE events for {int(_event_stale_elapsed)}s "
+                        f"after first byte (threshold: {int(_codex_idle_timeout)}s)"
+                    )
+                    _terminalize_timeout(result["error"])
             break
 
         # Stale-call detector: kill the connection if no response
@@ -1135,26 +1171,38 @@ def interruptible_api_call(agent, api_kwargs: dict):
             )
             # Wait briefly for the thread to notice the closed connection.
             t.join(timeout=2.0)
-            if result["error"] is None and result["response"] is None:
-                if _silent_hint:
-                    result["error"] = TimeoutError(
-                        f"Non-streaming API call timed out after {int(_elapsed)}s "
-                        f"with no response (threshold: {int(_stale_timeout)}s). "
-                        f"{_silent_hint}"
-                    )
-                else:
-                    result["error"] = TimeoutError(
-                        f"Non-streaming API call timed out after {int(_elapsed)}s "
-                        f"with no response (threshold: {int(_stale_timeout)}s)"
-                    )
+            with request_terminal_lock:
+                if result["error"] is None and result["response"] is None:
+                    if _silent_hint:
+                        result["error"] = TimeoutError(
+                            f"Non-streaming API call timed out after {int(_elapsed)}s "
+                            f"with no response (threshold: {int(_stale_timeout)}s). "
+                            f"{_silent_hint}"
+                        )
+                    else:
+                        result["error"] = TimeoutError(
+                            f"Non-streaming API call timed out after {int(_elapsed)}s "
+                            f"with no response (threshold: {int(_stale_timeout)}s)"
+                        )
+                    _terminalize_timeout(result["error"])
             break
 
         if agent._interrupt_requested:
-            # Mark THIS request cancelled before force-closing so the worker's
-            # exception handler recognizes the forced transport error as a
-            # cancel and exits cleanly instead of surfacing a network error or
-            # (in the streaming path) burning full retry cycles. (#6600)
-            _request_cancelled["value"] = True
+            # Serialize interruption against worker completion/failure. If a
+            # physical request already terminalized, that winner remains the
+            # provider lifecycle outcome; the outer turn can observe the flag
+            # after this helper returns/raises that established result.
+            terminal_won = False
+            with request_terminal_lock:
+                if request_monitor.terminal_kind in {"completed", "failed"}:
+                    terminal_won = True
+                else:
+                    _request_cancelled["value"] = True
+                    request_monitor.cancel(
+                        InterruptedError("provider request interrupted")
+                    )
+            if terminal_won:
+                continue
             logger.debug(
                 "Force-closing httpx client due to interrupt (not a network error)."
             )
@@ -1169,6 +1217,21 @@ def interruptible_api_call(agent, api_kwargs: dict):
             except Exception:
                 pass
             raise InterruptedError("Agent interrupted during API call")
+    # The worker can observe the interrupt and exit between poll iterations.
+    # Reconcile that winner here so cancellation is not silently returned as
+    # ``None``, while a completion/failure that won first is preserved.
+    if agent._interrupt_requested:
+        raise_interrupt = False
+        with request_terminal_lock:
+            if request_monitor.terminal_kind not in {"completed", "failed"}:
+                if request_monitor.terminal_kind is None:
+                    _request_cancelled["value"] = True
+                    request_monitor.cancel(
+                        InterruptedError("provider request interrupted")
+                    )
+                raise_interrupt = True
+        if raise_interrupt:
+            raise InterruptedError("Agent interrupted during API call (post-worker)")
     if deadline_error["value"] is not None:
         raise deadline_error["value"]
     if result["error"] is not None:
@@ -2603,6 +2666,32 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         # the entry check on the OpenAI/Anthropic path below.
         _check_stale_giveup(agent)
 
+        from agent.provider_request_watchdog import (
+            ProviderRequestMonitor,
+            ProviderRequestStalledError,
+        )
+        bedrock_monitor = ProviderRequestMonitor(
+            provider=str(getattr(agent, "provider", "") or "bedrock"),
+            model=str(
+                api_kwargs.get("modelId")
+                or getattr(agent, "model", "")
+                or ""
+            ),
+            timeout_seconds=_provider_request_timeout_seconds(agent),
+            event_callback=getattr(agent, "event_callback", None),
+        )
+        bedrock_delivery_lock = threading.RLock()
+        bedrock_partial_tool_names: list[str] = []
+        bedrock_monitor.begin_attempt(
+            api_request_id=str(
+                getattr(agent, "_current_api_request_id", "")
+                or f"bedrock-{threading.get_ident()}-{time.monotonic_ns()}"
+            ),
+            retry_count=int(
+                getattr(agent, "_current_api_retry_count", 0) or 0
+            ),
+        )
+
         def _fire_first():
             if not first_delta_fired["done"] and on_first_delta:
                 first_delta_fired["done"] = True
@@ -2625,6 +2714,36 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 )
                 intercepted_events = []
                 writer_token = {"value": None}
+
+                def _deliver_bedrock_output(callback) -> bool:
+                    with bedrock_delivery_lock:
+                        token = writer_token["value"]
+                        if bedrock_monitor.terminal or (
+                            token is not None
+                            and not stream_writer_is_current(agent, token)
+                        ):
+                            return False
+                        # Parse/delivery callbacks can lag the raw on_chunk hook;
+                        # establish an elapsed absolute deadline again at the
+                        # visible-output linearization point.
+                        bedrock_monitor.check_deadline()
+                        callback()
+                        return True
+
+                def _capture_bedrock_event(event: Any) -> None:
+                    with bedrock_delivery_lock:
+                        intercepted_events.append(event)
+                        try:
+                            bedrock_monitor.record_progress(
+                                len(repr(event).encode("utf-8", errors="replace"))
+                            )
+                        except ProviderRequestStalledError:
+                            raise
+                        except Exception:
+                            logger.debug(
+                                "Bedrock request progress telemetry failed",
+                                exc_info=True,
+                            )
 
                 def _open_bedrock_stream(next_api_kwargs: dict[str, Any]):
                     final_kwargs = dict(next_api_kwargs)
@@ -2659,17 +2778,23 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     return raw_response.get("stream", [])
 
                 def _on_text(text):
-                    _fire_first()
-                    agent._fire_stream_delta(text)
-                    deltas_were_sent["yes"] = True
+                    if _deliver_bedrock_output(
+                        lambda: (_fire_first(), agent._fire_stream_delta(text))
+                    ):
+                        deltas_were_sent["yes"] = True
 
                 def _on_tool(name):
-                    _fire_first()
-                    agent._fire_tool_gen_started(name)
+                    if _deliver_bedrock_output(
+                        lambda: (_fire_first(), agent._fire_tool_gen_started(name))
+                    ):
+                        deltas_were_sent["yes"] = True
+                        bedrock_partial_tool_names.append(name)
 
                 def _on_reasoning(text):
-                    _fire_first()
-                    agent._fire_reasoning_delta(text)
+                    if _deliver_bedrock_output(
+                        lambda: (_fire_first(), agent._fire_reasoning_delta(text))
+                    ):
+                        deltas_were_sent["yes"] = True
 
                 def _finalize_bedrock_stream():
                     return stream_converse_with_callbacks(
@@ -2691,7 +2816,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     model_name=str(getattr(agent, "model", "") or ""),
                     finalizer=_finalize_bedrock_stream,
                     on_stream_created=_bedrock_stream_created,
-                    on_chunk=intercepted_events.append,
+                    on_chunk=_capture_bedrock_event,
                     chunk_adapter=lambda chunk: chunk,
                     accept_chunk=_accept_bedrock_event,
                     completed_response_predicate=lambda response: bool(
@@ -2720,9 +2845,27 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     on_interrupt_check=lambda: agent._interrupt_requested,
                     on_event=lambda: _bedrock_last_event.__setitem__("t", time.time()),
                 )
-                result["response"] = stream.final_response or streamed_response
+                response = stream.final_response or streamed_response
+                with bedrock_delivery_lock:
+                    if agent._interrupt_requested:
+                        bedrock_monitor.cancel(
+                            InterruptedError("Bedrock request interrupted")
+                        )
+                        return
+                    if bedrock_monitor.complete():
+                        result["response"] = response
             except Exception as e:
-                result["error"] = e
+                if isinstance(e, ProviderRequestStalledError):
+                    result["error"] = e
+                else:
+                    with bedrock_delivery_lock:
+                        try:
+                            won_terminal = bedrock_monitor.fail(e)
+                        except ProviderRequestStalledError as stall_error:
+                            result["error"] = stall_error
+                        else:
+                            if won_terminal and result["error"] is None:
+                                result["error"] = e
             finally:
                 if stream is not None:
                     stream.close()
@@ -2733,7 +2876,43 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         t.start()
         while t.is_alive():
             t.join(timeout=0.3)
-            if agent._interrupt_requested:
+            deadline_exc = None
+            with bedrock_delivery_lock:
+                try:
+                    bedrock_monitor.check_deadline()
+                except ProviderRequestStalledError as exc:
+                    deadline_exc = exc
+                    result["error"] = exc
+                    # Supersede the worker's stream-writer token before
+                    # releasing the delivery gate; a botocore EventStream
+                    # cannot be externally cancelled and may emit late deltas.
+                    claim_stream_writer(agent)
+            if deadline_exc is not None:
+                try:
+                    from agent.bedrock_adapter import invalidate_runtime_client
+                    invalidate_runtime_client(_bedrock_region)
+                except Exception:
+                    logger.debug(
+                        "bedrock: deadline client eviction failed",
+                        exc_info=True,
+                    )
+                t.join(timeout=2.0)
+                break
+            if (
+                agent._interrupt_requested
+                and not isinstance(result["error"], ProviderRequestStalledError)
+            ):
+                terminal_won = False
+                with bedrock_delivery_lock:
+                    if bedrock_monitor.terminal_kind in {"completed", "failed"}:
+                        terminal_won = True
+                    else:
+                        bedrock_monitor.cancel(
+                            InterruptedError("Bedrock request interrupted")
+                        )
+                        claim_stream_writer(agent)
+                if terminal_won:
+                    continue
                 raise InterruptedError("Agent interrupted during Bedrock API call")
             # Liveness watchdog: no Bedrock event for longer than the stale
             # timeout means the stream has wedged (open socket, keep-alives but
@@ -2754,13 +2933,42 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 # Count the stale kill in the SAME cross-turn breaker as the
                 # OpenAI/Anthropic path (#58962).
                 _bump_stale_streak(agent)
-                # Best-effort: evict the region's cached bedrock-runtime client
-                # so the NEXT call reconnects with a fresh pool.  NOTE: this does
-                # NOT abort the in-flight botocore EventStream the worker thread
-                # is blocked on — botocore exposes no external cancellation for
-                # it — so the daemon worker keeps reading until its socket read
-                # ultimately errors.  We therefore end THIS call by raising
-                # below and let the streak+give-up breaker escalate across turns.
+                # Reset the timer so a repeated trip (should the worker somehow
+                # survive) waits a fresh interval rather than re-firing instantly.
+                _bedrock_last_event["t"] = time.time()
+                # End THIS physical attempt as a structured provider stall before
+                # consulting the cross-turn breaker. The daemon worker cannot be
+                # externally cancelled, so terminalize and supersede its writer
+                # token while holding the same gate used by callbacks.
+                stale_error = ProviderRequestStalledError(
+                    provider=str(getattr(agent, "provider", "") or "bedrock"),
+                    model=str(
+                        api_kwargs.get("modelId")
+                        or getattr(agent, "model", "")
+                        or ""
+                    ),
+                    timeout_seconds=_bedrock_stale_timeout,
+                    elapsed_seconds=_stale_elapsed,
+                    api_request_id=str(
+                        getattr(agent, "_current_api_request_id", "") or ""
+                    ),
+                    retry_count=int(
+                        getattr(agent, "_current_api_retry_count", 0) or 0
+                    ),
+                )
+                with bedrock_delivery_lock:
+                    try:
+                        bedrock_monitor.fail(stale_error)
+                    except ProviderRequestStalledError as deadline_stall:
+                        # If the absolute deadline elapsed concurrently, retain
+                        # that canonical attempt-local deadline metadata.
+                        stale_error = deadline_stall
+                    finally:
+                        claim_stream_writer(agent)
+                    result["error"] = stale_error
+                # Fence the terminal winner and its writer token BEFORE cache
+                # invalidation. Invalidation can release the blocked worker;
+                # callbacks must already observe this attempt as terminal.
                 try:
                     from agent.bedrock_adapter import invalidate_runtime_client
                     invalidate_runtime_client(_bedrock_region)
@@ -2768,22 +2976,9 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     logger.debug(
                         "bedrock: stale client eviction failed: %s", _inval_exc
                     )
-                # Reset the timer so a repeated trip (should the worker somehow
-                # survive) waits a fresh interval rather than re-firing instantly.
-                _bedrock_last_event["t"] = time.time()
-                # Escalate across turns: raises RuntimeError once the streak
-                # crosses HERMES_STREAM_STALE_GIVEUP, so a persistently wedged
-                # Bedrock provider aborts fast instead of re-waiting the timeout.
-                _check_stale_giveup(agent)
-                # Streak still under the give-up threshold: end THIS call with a
-                # TimeoutError so the outer retry loop / next turn re-evaluates
-                # and the streak carries forward.  Break rather than keep polling
-                # a worker we cannot abort.
-                result["error"] = TimeoutError(
-                    f"Bedrock stream produced no events for {int(_stale_elapsed)}s "
-                    f"(threshold {int(_bedrock_stale_timeout)}s) — aborting stalled "
-                    f"stream so the retry/fallback path can recover."
-                )
+                # The elevated streak is checked at the next call's entry. Do
+                # not raise the give-up RuntimeError here: doing so would bypass
+                # the structured terminal result that must map to worker exit 74.
                 break
         # Worker exited before the poll loop observed the interrupt flag. The
         # Bedrock stream callback breaks out and returns a PARTIAL response
@@ -2793,9 +2988,47 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         # never fires. Re-check here so /stop is not silently swallowed on the
         # Bedrock path — mirrors the post-worker guard on the main streaming
         # loop. (#59999 area)
-        if agent._interrupt_requested:
-            raise InterruptedError("Agent interrupted during Bedrock API call (post-worker)")
+        if (
+            agent._interrupt_requested
+            and not isinstance(result["error"], ProviderRequestStalledError)
+        ):
+            raise_interrupt = False
+            with bedrock_delivery_lock:
+                if bedrock_monitor.terminal_kind not in {"completed", "failed"}:
+                    if bedrock_monitor.terminal_kind is None:
+                        bedrock_monitor.cancel(
+                            InterruptedError("Bedrock request interrupted")
+                        )
+                    claim_stream_writer(agent)
+                    raise_interrupt = True
+            if raise_interrupt:
+                raise InterruptedError(
+                    "Agent interrupted during Bedrock API call (post-worker)"
+                )
         if result["error"] is not None:
+            if deltas_were_sent["yes"] or bedrock_partial_tool_names:
+                partial_text = (
+                    getattr(agent, "_current_streamed_assistant_text", "")
+                    or ""
+                ).strip() or None
+                if bedrock_partial_tool_names:
+                    name_str = ", ".join(bedrock_partial_tool_names[:3])
+                    if len(bedrock_partial_tool_names) > 3:
+                        name_str += f", +{len(bedrock_partial_tool_names) - 3} more"
+                    warning = (
+                        f"\n\n⚠ Stream stalled mid tool-call ({name_str}); "
+                        "the action was not executed. Ask me to retry if you "
+                        "want to continue."
+                    )
+                    partial_text = (partial_text or "") + warning
+                return _build_partial_stream_stub(
+                    "assistant",
+                    partial_text,
+                    None,
+                    api_kwargs.get("modelId") or getattr(agent, "model", None),
+                    None,
+                    dropped_tool_names=bedrock_partial_tool_names,
+                )
             raise result["error"]
         # Success — clear the cross-turn breaker (#58962): Bedrock proved
         # responsive.  Mirrors the OpenAI/Anthropic success reset below so a
@@ -2935,12 +3168,26 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
     # first.
     _stream_stale_timeout = None
     stream_attempt_lock = threading.Lock()
+    stream_delivery_lock = threading.RLock()
     stream_attempt_state = {
         "current": 0,
         "cancelled": set(),
         "discarded_chunks": 0,
         "discarded_bytes": 0,
     }
+    from agent.provider_request_watchdog import (
+        ProviderRequestMonitor,
+        ProviderRequestStalledError,
+    )
+    request_id = str(
+        getattr(agent, "_current_api_request_id", "")
+        or f"stream-{threading.get_ident()}-{time.monotonic_ns()}"
+    )
+    outer_retry_count = int(
+        getattr(agent, "_current_api_retry_count", 0) or 0
+    )
+    request_monitor_holder = {"attempt_id": 0, "monitor": None}
+    deadline_error: dict[str, ProviderRequestStalledError | None] = {"value": None}
     managed_stream_holder = {"stream": None}
 
     def _set_managed_stream(stream: Any) -> Any:
@@ -2962,8 +3209,61 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         with stream_attempt_lock:
             stream_attempt_state["current"] += 1
             attempt_id = int(stream_attempt_state["current"])
+        monitor = ProviderRequestMonitor(
+            provider=str(getattr(agent, "provider", "") or ""),
+            model=str(getattr(agent, "model", "") or ""),
+            timeout_seconds=_provider_request_timeout_seconds(agent),
+            event_callback=getattr(agent, "event_callback", None),
+        )
+        monitor.begin_attempt(
+            api_request_id=request_id,
+            retry_count=outer_retry_count + attempt_id - 1,
+        )
+        with stream_attempt_lock:
+            request_monitor_holder["attempt_id"] = attempt_id
+            request_monitor_holder["monitor"] = monitor
         provider_tool_in_flight["yes"] = False
         return attempt_id
+
+    def _stream_attempt_monitor(stream_attempt_id: int):
+        with stream_attempt_lock:
+            if request_monitor_holder["attempt_id"] != stream_attempt_id:
+                return None
+            return request_monitor_holder["monitor"]
+
+    def _record_stream_progress(stream_attempt_id: int, chunk: Any) -> None:
+        with stream_delivery_lock:
+            monitor = _stream_attempt_monitor(stream_attempt_id)
+            if monitor is None:
+                return
+            try:
+                monitor.record_progress(
+                    len(repr(chunk).encode("utf-8", errors="replace"))
+                )
+            except ProviderRequestStalledError:
+                raise
+            except Exception:
+                logger.debug(
+                    "Provider request progress telemetry failed",
+                    exc_info=True,
+                )
+
+    def _deliver_stream_output(stream_attempt_id: int, callback) -> bool:
+        """Fence visible callbacks against deadline/cancellation terminalization."""
+        with stream_delivery_lock:
+            monitor = _stream_attempt_monitor(stream_attempt_id)
+            if (
+                monitor is None
+                or monitor.terminal
+                or not _stream_attempt_is_active(stream_attempt_id)
+            ):
+                return False
+            # The poll thread may not have run since the fixed deadline elapsed.
+            # Establish deadline terminalization at the callback linearization
+            # point so a no-chunk completed-response fallback cannot publish late.
+            monitor.check_deadline()
+            callback()
+            return True
 
     def _cancel_current_stream_attempt(reason: str) -> None:
         with stream_attempt_lock:
@@ -3208,6 +3508,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         for chunk in stream:
             last_chunk_time["t"] = time.time()
             agent._touch_activity("receiving stream response")
+            _record_stream_progress(stream_attempt_id, chunk)
 
             # Update per-attempt diagnostic counters.  Best-effort —
             # failures are swallowed so the streaming hot path is never
@@ -3270,16 +3571,27 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             reasoning_text = getattr(delta, "reasoning_content", None) or getattr(delta, "reasoning", None)
             if reasoning_text:
                 reasoning_parts.append(reasoning_text)
-                _fire_first_delta()
-                agent._fire_reasoning_delta(reasoning_text)
+                if _deliver_stream_output(
+                    stream_attempt_id,
+                    lambda: (
+                        _fire_first_delta(),
+                        agent._fire_reasoning_delta(reasoning_text),
+                    ),
+                ):
+                    deltas_were_sent["yes"] = True
 
             # Accumulate text content — fire callback only when no tool calls
             if delta and delta.content:
                 content_parts.append(delta.content)
                 if not tool_calls_acc:
-                    _fire_first_delta()
-                    agent._fire_stream_delta(delta.content)
-                    deltas_were_sent["yes"] = True
+                    if _deliver_stream_output(
+                        stream_attempt_id,
+                        lambda: (
+                            _fire_first_delta(),
+                            agent._fire_stream_delta(delta.content),
+                        ),
+                    ):
+                        deltas_were_sent["yes"] = True
                 # Tool calls suppress regular content streaming (avoids
                 # displaying chatty "I'll use the tool..." text alongside
                 # tool calls).  But reasoning tags embedded in suppressed
@@ -3293,8 +3605,19 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 # box is already closed (tool boundary flush).
                 elif agent.stream_delta_callback:
                     try:
-                        agent.stream_delta_callback(delta.content)
-                        agent._record_streamed_assistant_text(delta.content)
+                        if _deliver_stream_output(
+                            stream_attempt_id,
+                            lambda: (
+                                agent.stream_delta_callback(delta.content),
+                                agent._record_streamed_assistant_text(delta.content),
+                            ),
+                        ):
+                            deltas_were_sent["yes"] = True
+                    except ProviderRequestStalledError:
+                        # Never turn a canonical absolute-deadline winner into
+                        # an empty worker result merely because this optional
+                        # display callback historically tolerated UI errors.
+                        raise
                     except Exception:
                         pass
 
@@ -3361,16 +3684,18 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     name = entry["function"]["name"]
                     if name and idx not in tool_gen_notified:
                         tool_gen_notified.add(idx)
-                        _fire_first_delta()
-                        agent._fire_tool_gen_started(name)
-                        # Record the partial tool-call name so the outer
-                        # stub-builder can surface a user-visible warning
-                        # if streaming dies before this tool's arguments
-                        # are fully delivered.  Without this, a stall
-                        # during tool-call JSON generation lets the stub
-                        # at line ~6107 return `tool_calls=None`, silently
-                        # discarding the attempted action.
-                        result["partial_tool_names"].append(name)
+                        if _deliver_stream_output(
+                            stream_attempt_id,
+                            lambda: (
+                                _fire_first_delta(),
+                                agent._fire_tool_gen_started(name),
+                            ),
+                        ):
+                            # Record the partial tool-call name so the outer
+                            # stub-builder can surface a user-visible warning
+                            # if streaming dies before this tool's arguments
+                            # are fully delivered.
+                            result["partial_tool_names"].append(name)
 
             if chunk.choices[0].finish_reason:
                 finish_reason = chunk.choices[0].finish_reason
@@ -3411,12 +3736,24 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     or getattr(message, "reasoning", None)
                 )
                 if isinstance(reasoning_text, str) and reasoning_text:
-                    _fire_first_delta()
-                    agent._fire_reasoning_delta(reasoning_text)
+                    if _deliver_stream_output(
+                        stream_attempt_id,
+                        lambda: (
+                            _fire_first_delta(),
+                            agent._fire_reasoning_delta(reasoning_text),
+                        ),
+                    ):
+                        deltas_were_sent["yes"] = True
                 content = getattr(message, "content", None)
                 if isinstance(content, str) and content:
-                    _fire_first_delta()
-                    agent._fire_stream_delta(content)
+                    if _deliver_stream_output(
+                        stream_attempt_id,
+                        lambda: (
+                            _fire_first_delta(),
+                            agent._fire_stream_delta(content),
+                        ),
+                    ):
+                        deltas_were_sent["yes"] = True
             return final_response
 
         # Build mock response matching non-streaming shape
@@ -3554,7 +3891,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             usage=usage_obj,
         )
 
-    def _call_anthropic(request_client):
+    def _call_anthropic(request_client, stream_attempt_id: int):
         """Stream an Anthropic Messages API response.
 
         Fires delta callbacks for real-time token delivery, but returns
@@ -3617,6 +3954,8 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             _writer_token["value"] = claim_stream_writer(agent)
 
         def _accept_anthropic_event(_event: Any) -> bool:
+            if not _stream_attempt_is_active(stream_attempt_id):
+                return False
             token = _writer_token["value"]
             if token is None or stream_writer_is_current(agent, token):
                 return True
@@ -3658,6 +3997,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 saw_stream_event = True
                 last_chunk_time["t"] = time.time()
                 agent._touch_activity("receiving stream response")
+                _record_stream_progress(stream_attempt_id, event)
                 try:
                     _diag["chunks"] = int(_diag.get("chunks", 0)) + 1
                     if _diag.get("first_chunk_at") is None:
@@ -3675,8 +4015,15 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                         has_tool_use = True
                         tool_name = getattr(block, "name", None)
                         if tool_name:
-                            _fire_first_delta()
-                            agent._fire_tool_gen_started(tool_name)
+                            if _deliver_stream_output(
+                                stream_attempt_id,
+                                lambda: (
+                                    _fire_first_delta(),
+                                    agent._fire_tool_gen_started(tool_name),
+                                ),
+                            ):
+                                deltas_were_sent["yes"] = True
+                                result["partial_tool_names"].append(tool_name)
                 elif event_type == "content_block_delta":
                     delta = getattr(event, "delta", None)
                     if delta:
@@ -3684,14 +4031,25 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                         if delta_type == "text_delta":
                             text = getattr(delta, "text", "")
                             if text and not has_tool_use:
-                                _fire_first_delta()
-                                agent._fire_stream_delta(text)
-                                deltas_were_sent["yes"] = True
+                                if _deliver_stream_output(
+                                    stream_attempt_id,
+                                    lambda: (
+                                        _fire_first_delta(),
+                                        agent._fire_stream_delta(text),
+                                    ),
+                                ):
+                                    deltas_were_sent["yes"] = True
                         elif delta_type == "thinking_delta":
                             thinking_text = getattr(delta, "thinking", "")
                             if thinking_text:
-                                _fire_first_delta()
-                                agent._fire_reasoning_delta(thinking_text)
+                                if _deliver_stream_output(
+                                    stream_attempt_id,
+                                    lambda: (
+                                        _fire_first_delta(),
+                                        agent._fire_reasoning_delta(thinking_text),
+                                    ),
+                                ):
+                                    deltas_were_sent["yes"] = True
             if not agent._interrupt_requested:
                 raw_stream = _stream_context["stream"]
                 if raw_stream is not None:
@@ -3752,6 +4110,11 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 # causing multi-minute delays between /stop and response.
                 if agent._interrupt_requested:
                     _cancel_current_stream_attempt("interrupt_before_stream_retry")
+                    monitor = _stream_attempt_monitor(stream_attempt_id)
+                    if monitor is not None:
+                        monitor.cancel(
+                            InterruptedError("provider stream retry interrupted")
+                        )
                     raise InterruptedError("Agent interrupted before stream retry")
                 try:
                     if agent.api_mode == "anthropic_messages":
@@ -3764,9 +4127,27 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                             ),
                             kind="anthropic_messages",
                         )
-                        result["response"] = _call_anthropic(request_client)
+                        response = _call_anthropic(
+                            request_client, stream_attempt_id
+                        )
                     else:
-                        result["response"] = _call_chat_completions(stream_attempt_id)
+                        response = _call_chat_completions(stream_attempt_id)
+                    with stream_delivery_lock:
+                        monitor = _stream_attempt_monitor(stream_attempt_id)
+                        if agent._interrupt_requested:
+                            _request_cancelled["value"] = True
+                            if monitor is not None:
+                                monitor.cancel(
+                                    InterruptedError(
+                                        "provider stream interrupted before completion"
+                                    )
+                                )
+                            _cancel_current_stream_attempt(
+                                "stream_interrupt_worker_completion"
+                            )
+                            return
+                        if monitor is None or monitor.complete():
+                            result["response"] = response
                     return  # success
                 except Exception as e:
                     _close_managed_stream()
@@ -3779,12 +4160,27 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     # interrupt hang where doomed retries burned full
                     # stream-stale-timeout cycles. (#6600)
                     if _request_cancelled["value"]:
+                        monitor = _stream_attempt_monitor(stream_attempt_id)
+                        if monitor is not None:
+                            monitor.cancel(
+                                InterruptedError("provider stream cancelled")
+                            )
                         logger.debug(
                             "Streaming worker caught %s after request "
                             "cancellation — exiting without retry.",
                             type(e).__name__,
                         )
                         return
+                    if isinstance(e, ProviderRequestStalledError):
+                        result["error"] = e
+                        return
+                    monitor = _stream_attempt_monitor(stream_attempt_id)
+                    if monitor is not None:
+                        try:
+                            monitor.fail(e)
+                        except ProviderRequestStalledError as stall_error:
+                            result["error"] = stall_error
+                            return
                     _is_timeout = isinstance(
                         e, (_httpx.ReadTimeout, _httpx.ConnectTimeout, _httpx.PoolTimeout)
                     )
@@ -4135,6 +4531,27 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
     while t.is_alive():
         t.join(timeout=0.3)
 
+        deadline_exc = None
+        with stream_delivery_lock:
+            with stream_attempt_lock:
+                active_monitor = request_monitor_holder.get("monitor")
+            if active_monitor is not None:
+                try:
+                    active_monitor.check_deadline()
+                except ProviderRequestStalledError as exc:
+                    deadline_exc = exc
+                    deadline_error["value"] = exc
+                    result["error"] = exc
+                    _request_cancelled["value"] = True
+                    _cancel_current_stream_attempt("provider_request_deadline")
+        if deadline_exc is not None:
+            try:
+                _close_request_client_once("provider_request_deadline")
+            except Exception:
+                pass
+            t.join(timeout=2.0)
+            break
+
         # Periodic heartbeat: touch the agent's activity tracker so the
         # gateway's inactivity monitor knows we're alive while waiting
         # for stream chunks.  Without this, long thinking pauses (e.g.
@@ -4190,7 +4607,8 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 f"Reconnecting..."
             )
             try:
-                _cancel_current_stream_attempt("stale_stream_kill")
+                with stream_delivery_lock:
+                    _cancel_current_stream_attempt("stale_stream_kill")
                 _close_request_client_once("stale_stream_kill")
             except Exception:
                 pass
@@ -4229,18 +4647,39 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 f"stale stream detected after {int(_stale_elapsed)}s, reconnecting"
             )
 
-        if agent._interrupt_requested:
+        if (
+            agent._interrupt_requested
+            and not isinstance(result["error"], ProviderRequestStalledError)
+        ):
             # Mark THIS request cancelled before force-closing so the worker's
             # exception handler recognizes the forced transport error as a
             # cancel and exits without retrying or surfacing a network error.
             # (#6600)
-            _request_cancelled["value"] = True
+            terminal_won = False
+            with stream_delivery_lock:
+                with stream_attempt_lock:
+                    active_monitor = request_monitor_holder.get("monitor")
+                terminal_won = (
+                    active_monitor is not None
+                    and active_monitor.terminal_kind in {"completed", "failed"}
+                )
+                if not terminal_won:
+                    _request_cancelled["value"] = True
+                    if active_monitor is not None:
+                        active_monitor.cancel(
+                            InterruptedError("provider stream interrupted")
+                        )
+                    _cancel_current_stream_attempt("stream_interrupt_abort")
+            if terminal_won:
+                # A physical attempt completed or failed before the interrupt
+                # acquired the delivery gate. Preserve that terminal winner;
+                # the worker will publish its corresponding result.
+                continue
             logger.debug(
                 "Force-closing streaming httpx client due to interrupt "
                 "(not a network error)."
             )
             try:
-                _cancel_current_stream_attempt("stream_interrupt_abort")
                 # #67142: kind-aware — anthropic aborts the request-local
                 # client's socket from this poll thread; the shared
                 # _anthropic_client is never closed here.
@@ -4253,10 +4692,30 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
     # (e.g. _call_anthropic() detected _interrupt_requested and returned
     # None), the InterruptedError above was never raised.  Re-check the
     # flag here so /stop is not silently swallowed.  (#59999 area)
-    if agent._interrupt_requested:
-        raise InterruptedError("Agent interrupted during streaming API call (post-worker)")
+    if (
+        agent._interrupt_requested
+        and not isinstance(result["error"], ProviderRequestStalledError)
+    ):
+        terminal_won = False
+        with stream_delivery_lock:
+            with stream_attempt_lock:
+                active_monitor = request_monitor_holder.get("monitor")
+            terminal_won = (
+                active_monitor is not None
+                and active_monitor.terminal_kind in {"completed", "failed"}
+            )
+            if not terminal_won:
+                if active_monitor is not None:
+                    active_monitor.cancel(
+                        InterruptedError("provider stream interrupted")
+                    )
+                _cancel_current_stream_attempt("stream_interrupt_post_worker")
+        if not terminal_won:
+            raise InterruptedError(
+                "Agent interrupted during streaming API call (post-worker)"
+            )
     if result["error"] is not None:
-        if deltas_were_sent["yes"]:
+        if deltas_were_sent["yes"] or result.get("partial_tool_names"):
             # Streaming failed AFTER some tokens were already delivered to
             # the platform.  Re-raising would let the outer retry loop make
             # Return a partial response stub with finish_reason="length"

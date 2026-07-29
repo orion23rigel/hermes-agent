@@ -43,7 +43,7 @@ def get_provider_request_timeout(
 def get_provider_stale_timeout(
     provider_id: str, model: str | None = None
 ) -> float | None:
-    """Return a configured non-stream stale timeout in seconds, if any."""
+    """Return a configured provider inactivity timeout in seconds, if any."""
     if not provider_id:
         return None
 

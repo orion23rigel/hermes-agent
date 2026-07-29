@@ -169,3 +169,90 @@ def test_nonstream_response_before_deadline_is_preserved(monkeypatch, platform):
         "provider_request.started",
         "provider_request.completed",
     ]
+
+
+def test_nonstream_worker_observed_interrupt_terminalizes_as_cancel(monkeypatch):
+    from agent import chat_completion_helpers as helpers
+
+    agent = _DeadlineAgent("cli")
+    agent._resolved_api_call_timeout = lambda: 0.5
+
+    def interrupted_dispatch(*_args, **_kwargs):
+        agent._interrupt_requested = True
+        return object()
+
+    monkeypatch.setattr(
+        helpers,
+        "_dispatch_nonstreaming_api_request",
+        interrupted_dispatch,
+    )
+
+    with pytest.raises(InterruptedError):
+        helpers.interruptible_api_call(
+            agent, {"model": agent.model, "messages": []}
+        )
+    assert [name for name, _ in agent.events] == [
+        "provider_request.started",
+        "provider_request.failed",
+    ]
+    assert agent.events[-1][1]["error_code"] == "InterruptedError"
+
+
+def test_nonstream_completed_terminal_winner_survives_late_interrupt(monkeypatch):
+    from agent import chat_completion_helpers as helpers
+
+    agent = _DeadlineAgent("cli")
+    agent._resolved_api_call_timeout = lambda: 0.5
+    response = object()
+
+    def record_and_interrupt(name, payload):
+        agent.events.append((name, payload))
+        if name == "provider_request.completed":
+            agent._interrupt_requested = True
+
+    agent.event_callback = record_and_interrupt
+    monkeypatch.setattr(
+        helpers,
+        "_dispatch_nonstreaming_api_request",
+        lambda *_args, **_kwargs: response,
+    )
+
+    assert helpers.interruptible_api_call(
+        agent, {"model": agent.model, "messages": []}
+    ) is response
+    assert [name for name, _ in agent.events] == [
+        "provider_request.started",
+        "provider_request.completed",
+    ]
+
+
+def test_nonstream_stale_detector_does_not_overwrite_worker_error(monkeypatch):
+    from agent import chat_completion_helpers as helpers
+
+    agent = _DeadlineAgent("cli")
+    agent._resolved_api_call_timeout = lambda: 1.0
+    agent._compute_non_stream_stale_timeout = lambda _kwargs: 0.01
+
+    def worker_failure(_agent, _api_kwargs, *, make_client):
+        make_client("stale-race")
+        # The first 300ms poll returns while this request is still alive, so
+        # the stale path closes the client and joins this worker before trying
+        # to synthesize its own timeout.
+        time.sleep(0.35)
+        raise ValueError("canonical worker failure")
+
+    monkeypatch.setattr(
+        helpers,
+        "_dispatch_nonstreaming_api_request",
+        worker_failure,
+    )
+
+    with pytest.raises(ValueError, match="canonical worker failure"):
+        helpers.interruptible_api_call(
+            agent, {"model": agent.model, "messages": []}
+        )
+    assert [name for name, _ in agent.events] == [
+        "provider_request.started",
+        "provider_request.failed",
+    ]
+    assert agent.events[-1][1]["error_code"] == "ValueError"

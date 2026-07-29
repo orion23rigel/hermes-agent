@@ -27,6 +27,8 @@ from unittest.mock import MagicMock, patch
 import httpx
 import pytest
 
+from agent.provider_request_watchdog import ProviderRequestStalledError
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -170,3 +172,112 @@ class TestAnthropicStreamPoolCleanup:
         # The shared Anthropic client is never rebuilt from inside a request.
         mock_rebuild.assert_not_called()
         assert attempt_count[0] >= 2  # stale-killed once, then retried
+
+
+def test_anthropic_stream_absolute_deadline_aborts_request_client(monkeypatch):
+    monkeypatch.setenv("HERMES_STREAM_RETRIES", "0")
+    agent = _make_anthropic_agent()
+    agent._resolved_api_call_timeout = lambda: 0.05
+    agent._current_api_request_id = "req-anthropic-deadline"
+    events = []
+    agent.event_callback = lambda name, payload: events.append((name, payload))
+    unblock = threading.Event()
+
+    cm = MagicMock()
+    stream = MagicMock()
+
+    def _blocking_gen():
+        unblock.wait(timeout=2.0)
+        raise httpx.ConnectError("connection closed after deadline")
+        yield
+
+    stream.__iter__ = MagicMock(return_value=_blocking_gen())
+    cm.__enter__ = MagicMock(return_value=stream)
+    cm.__exit__ = MagicMock(return_value=False)
+    agent._anthropic_client.messages.stream.return_value = cm
+    agent._abort_request_anthropic_client = lambda *a, **k: unblock.set()
+
+    with pytest.raises(ProviderRequestStalledError) as exc_info:
+        agent._interruptible_streaming_api_call({})
+
+    assert exc_info.value.error_code == "provider_request_stalled"
+    assert unblock.is_set()
+    assert [name for name, _ in events] == [
+        "provider_request.started",
+        "provider_request.failed",
+    ]
+
+
+def test_anthropic_partial_tool_start_returns_safe_stub_without_retry(monkeypatch):
+    monkeypatch.setenv("HERMES_STREAM_RETRIES", "1")
+    agent = _make_anthropic_agent()
+    agent._resolved_api_call_timeout = lambda: 0.05
+    tool_starts = []
+    agent.tool_gen_callback = tool_starts.append
+    unblock = threading.Event()
+    attempts = [0]
+
+    cm = MagicMock()
+    stream = MagicMock()
+    tool_event = SimpleNamespace(
+        type="content_block_start",
+        content_block=SimpleNamespace(type="tool_use", name="terminal"),
+    )
+
+    def _tool_then_block():
+        attempts[0] += 1
+        yield tool_event
+        unblock.wait(timeout=2.0)
+        raise httpx.ConnectError("connection closed after deadline")
+
+    stream.__iter__ = MagicMock(side_effect=lambda: _tool_then_block())
+    cm.__enter__ = MagicMock(return_value=stream)
+    cm.__exit__ = MagicMock(return_value=False)
+    agent._anthropic_client.messages.stream.return_value = cm
+    agent._abort_request_anthropic_client = lambda *a, **k: unblock.set()
+
+    response = agent._interruptible_streaming_api_call({})
+
+    assert attempts == [1]
+    assert tool_starts == ["terminal"]
+    choice = response.choices[0]
+    assert choice.message.tool_calls is None
+    assert "terminal" in choice.message.content
+    assert "action was not executed" in choice.message.content
+
+
+def test_anthropic_late_event_after_deadline_is_fenced(monkeypatch):
+    monkeypatch.setenv("HERMES_STREAM_RETRIES", "0")
+    agent = _make_anthropic_agent()
+    agent._resolved_api_call_timeout = lambda: 0.05
+    deltas = []
+    agent.stream_delta_callback = deltas.append
+    unblock = threading.Event()
+
+    cm = MagicMock()
+    stream = MagicMock()
+    late_event = SimpleNamespace(
+        type="content_block_delta",
+        delta=SimpleNamespace(type="text_delta", text="late text"),
+    )
+
+    def _late_event_after_abort():
+        unblock.wait(timeout=2.0)
+        yield late_event
+
+    stream.__iter__ = MagicMock(side_effect=lambda: _late_event_after_abort())
+    stream.get_final_message = MagicMock(return_value=SimpleNamespace(
+        content=[],
+        stop_reason="end_turn",
+        usage=SimpleNamespace(input_tokens=1, output_tokens=1),
+    ))
+    cm.__enter__ = MagicMock(return_value=stream)
+    cm.__exit__ = MagicMock(return_value=False)
+    agent._anthropic_client.messages.stream.return_value = cm
+    agent._abort_request_anthropic_client = lambda *a, **k: unblock.set()
+
+    with pytest.raises(ProviderRequestStalledError):
+        agent._interruptible_streaming_api_call({})
+
+    assert unblock.is_set()
+    assert deltas == []

@@ -84,6 +84,7 @@ class ProviderRequestMonitor:
         self._retry_count = 0
         self._bytes_received = 0
         self._terminal = False
+        self._terminal_kind: str | None = None
 
     @property
     def deadline(self) -> float | None:
@@ -94,6 +95,16 @@ class ProviderRequestMonitor:
     def bytes_received(self) -> int:
         with self._lock:
             return self._bytes_received
+
+    @property
+    def terminal(self) -> bool:
+        with self._lock:
+            return self._terminal
+
+    @property
+    def terminal_kind(self) -> str | None:
+        with self._lock:
+            return self._terminal_kind
 
     def begin_attempt(
         self,
@@ -110,22 +121,37 @@ class ProviderRequestMonitor:
             self._retry_count = max(0, int(retry_count))
             self._bytes_received = 0
             self._terminal = False
+            self._terminal_kind = None
             payload = self._payload_locked(now)
         self._emit("provider_request.started", payload)
 
     def record_progress(self, bytes_received: int = 0) -> None:
+        """Record accepted bytes, rejecting progress after the absolute deadline."""
         now = self._clock()
         payload: dict[str, Any] | None = None
+        stall_error: ProviderRequestStalledError | None = None
+        event = "provider_request.progress"
         with self._lock:
             if self._started_at is None or self._terminal:
                 return
-            self._bytes_received += max(0, int(bytes_received))
-            last = self._last_progress_event_at
-            if last is None or now - last >= self._progress_interval_seconds:
-                self._last_progress_event_at = now
-                payload = self._payload_locked(now)
+            if self._deadline is not None and now >= self._deadline:
+                stall_error = self._stall_error_locked(now)
+                self._terminal = True
+                self._terminal_kind = "failed"
+                payload = self._payload_locked(
+                    now, error_code=PROVIDER_REQUEST_STALLED
+                )
+                event = "provider_request.failed"
+            else:
+                self._bytes_received += max(0, int(bytes_received))
+                last = self._last_progress_event_at
+                if last is None or now - last >= self._progress_interval_seconds:
+                    self._last_progress_event_at = now
+                    payload = self._payload_locked(now)
         if payload is not None:
-            self._emit("provider_request.progress", payload)
+            self._emit(event, payload)
+        if stall_error is not None:
+            raise stall_error
 
     def check_deadline(self) -> None:
         now = self._clock()
@@ -141,6 +167,7 @@ class ProviderRequestMonitor:
                 return
             error = self._stall_error_locked(now)
             self._terminal = True
+            self._terminal_kind = "failed"
             payload = self._payload_locked(now, error_code=PROVIDER_REQUEST_STALLED)
         self._emit("provider_request.failed", payload)
         raise error
@@ -154,12 +181,14 @@ class ProviderRequestMonitor:
                 return False
             self._terminal = True
             if now - self._started_at >= self.timeout_seconds:
+                self._terminal_kind = "failed"
                 stall_error = self._stall_error_locked(now)
                 payload = self._payload_locked(
                     now, error_code=stall_error.error_code
                 )
                 event = "provider_request.failed"
             else:
+                self._terminal_kind = "completed"
                 payload = self._payload_locked(now)
                 event = "provider_request.completed"
         self._emit(event, payload)
@@ -178,6 +207,7 @@ class ProviderRequestMonitor:
             if self._started_at is None or self._terminal:
                 return False
             self._terminal = True
+            self._terminal_kind = "failed"
             if now - self._started_at >= self.timeout_seconds:
                 stall_error = self._stall_error_locked(now)
                 error_code = stall_error.error_code
@@ -185,6 +215,21 @@ class ProviderRequestMonitor:
         self._emit("provider_request.failed", payload)
         if stall_error is not None:
             raise stall_error
+        return True
+
+    def cancel(self, error: BaseException) -> bool:
+        """Terminate an explicitly cancelled attempt without deadline precedence."""
+        now = self._clock()
+        error_code = _diagnostic_label(
+            str(getattr(error, "error_code", "") or type(error).__name__)
+        )
+        with self._lock:
+            if self._started_at is None or self._terminal:
+                return False
+            self._terminal = True
+            self._terminal_kind = "cancelled"
+            payload = self._payload_locked(now, error_code=error_code)
+        self._emit("provider_request.failed", payload)
         return True
 
     def _stall_error_locked(self, now: float) -> ProviderRequestStalledError:

@@ -5259,6 +5259,12 @@ def run_conversation(
                         "completed": False,
                         "failed": True,
                         "error": _final_summary,
+                        "error_code": str(
+                            getattr(api_error, "error_code", "") or ""
+                        ) or None,
+                        "retryable": bool(
+                            getattr(api_error, "retryable", False)
+                        ),
                         # Surface the classified reason so callers (notably the
                         # kanban worker path in cli.py) can distinguish a
                         # transient throttle from a real failure and choose a
