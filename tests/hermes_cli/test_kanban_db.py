@@ -968,6 +968,50 @@ def test_rate_limit_exit_requeues_without_counting_failure(
         assert "crashed" not in outcomes
 
 
+def test_retryable_failure_requeues_counts_and_trips_bounded_breaker(
+    kanban_home, monkeypatch,
+):
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+
+    with kb.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(conn, title="retryable-stall", assignee="a")
+
+        for i in range(2):
+            pid = 71000 + i
+            kb.claim_task(conn, tid, claimer=f"{host}:retryable-{i}")
+            conn.execute(
+                "UPDATE tasks SET worker_pid=? WHERE id=?",
+                (pid, tid),
+            )
+            conn.commit()
+            _kb._record_worker_exit(
+                pid, _exited_status(_kb.KANBAN_RETRYABLE_FAILURE_EXIT_CODE)
+            )
+
+            reclaimed = kb.detect_crashed_workers(conn)
+            assert tid in reclaimed
+            task = kb.get_task(conn, tid)
+            assert task.consecutive_failures == i + 1
+            if i == 0:
+                assert task.status == "ready"
+            else:
+                assert task.status == "blocked"
+
+        outcomes = [
+            row["outcome"]
+            for row in conn.execute(
+                "SELECT outcome FROM task_runs WHERE task_id=? ORDER BY started_at",
+                (tid,),
+            ).fetchall()
+        ]
+        assert outcomes == ["retryable_failure", "retryable_failure"]
+
+
+
 def test_real_crash_still_counts_and_trips_breaker(kanban_home, monkeypatch):
     """Sanity: a genuine non-zero crash (not the sentinel) still increments
     the failure counter and trips the breaker — the rate-limit carve-out is

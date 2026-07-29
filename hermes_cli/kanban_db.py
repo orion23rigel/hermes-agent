@@ -260,6 +260,8 @@ KANBAN_RATE_LIMIT_EXIT_CODE = 75
 # Retryable provider request failure, distinct from quota walls and generic
 # worker crashes so the dispatcher can persist and back off the right outcome.
 KANBAN_RETRYABLE_FAILURE_EXIT_CODE = 74
+
+
 # BSD EX_CONFIG. A worker uses this only when its fail-closed startup
 # preflight cannot build a valid execution route; dispatcher retries cannot
 # repair profile/model/sandbox configuration, so this trips immediately.
@@ -8250,8 +8252,9 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # clean-exit-but-still-running case, which is accounted against its
     # own bounded violation streak instead of the unified failure
     # counter (see the post-txn loop below).
-    crash_details: list[tuple[str, int, str, bool, bool, str]] = []
-    # (task_id, pid, claimer, protocol_violation, permanent_failure, error_text)
+    crash_details: list[tuple[str, int, str, bool, bool, str, str]] = []
+    # (task_id, pid, claimer, protocol_violation, permanent_failure,
+    #  failure_outcome, error_text)
     with write_txn(conn):
         rows = conn.execute(
             "SELECT id, worker_pid, claim_lock, started_at FROM tasks "
@@ -8277,6 +8280,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
             pid = int(row["worker_pid"])
             kind, code = _classify_worker_exit(pid)
             rate_limited_exit = False
+            retryable_failure_exit = False
             permanent_failure = False
             if kind in {"clean_exit", "protocol_failure"}:
                 # Worker subprocess returned 0 but its task is still
@@ -8323,6 +8327,20 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 event_payload = {
                     "pid": pid,
                     "claimer": row["claim_lock"],
+                    "exit_code": code,
+                }
+            elif kind == "retryable_failure":
+                protocol_violation = False
+                retryable_failure_exit = True
+                error_text = (
+                    f"pid {pid} exited after a retryable provider request stall "
+                    f"(exit code {code}); requeued with bounded retry accounting"
+                )
+                event_kind = "retryable_failure"
+                event_payload = {
+                    "pid": pid,
+                    "claimer": row["claim_lock"],
+                    "exit_kind": kind,
                     "exit_code": code,
                 }
             elif kind == "permanent_failure":
@@ -8416,6 +8434,8 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 # history doesn't show a phantom crash for a quota wall.
                 if rate_limited_exit:
                     _run_outcome = "rate_limited"
+                elif retryable_failure_exit:
+                    _run_outcome = "retryable_failure"
                 else:
                     _run_outcome = "crashed"
                 run_id = _end_run(
@@ -8456,7 +8476,8 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     crashed.append(row["id"])
                     crash_details.append(
                         (row["id"], pid, row["claim_lock"],
-                         protocol_violation, permanent_failure, error_text)
+                         protocol_violation, permanent_failure, _run_outcome,
+                         error_text)
                     )
     # Outside the main txn: account each crashed task and maybe trip the
     # breaker (the task transitions ready → blocked with a ``gave_up`` event
@@ -8478,7 +8499,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     if crash_details:
         # Fingerprint errors to detect systemic failures.
         _fp_counts: dict[str, int] = {}
-        for _, _, _, _, _, err_text in crash_details:
+        for _, _, _, _, _, _, err_text in crash_details:
             fp = _error_fingerprint(err_text)
             _fp_counts[fp] = _fp_counts.get(fp, 0) + 1
         for (
@@ -8487,6 +8508,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
             claimer,
             protocol_violation,
             permanent_failure,
+            failure_outcome,
             error_text,
         ) in crash_details:
             if permanent_failure:
@@ -8540,11 +8562,18 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     auto_blocked.append(tid)
                 continue
             fp = _error_fingerprint(error_text)
-            is_systemic = _fp_counts.get(fp, 0) >= 3
+            # Provider stalls are transient infrastructure outcomes. They
+            # consume the normal bounded retry budget, but three concurrent
+            # stalls must not trip the same-error systemic breaker on their
+            # first observation.
+            is_systemic = (
+                failure_outcome != "retryable_failure"
+                and _fp_counts.get(fp, 0) >= 3
+            )
             tripped = _record_task_failure(
                 conn, tid,
                 error=error_text,
-                outcome="crashed",
+                outcome=failure_outcome,
                 failure_limit=1 if is_systemic else None,
                 release_claim=False,
                 end_run=False,
@@ -8846,6 +8875,7 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
         never increments ``consecutive_failures``, so the breaker can't free
         it). Once the cooldown elapses the task falls through and respawns.
 
+
     ``"blocker_auth"``
         The task's last failure error matches a quota / authentication
         pattern. Retrying immediately is unlikely to help (rate limits
@@ -8917,6 +8947,7 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
         # (cheaply, spaced by the cooldown) until quota returns or a real
         # crash/completion supersedes it.
         return None
+
 
     # 2. Quota / auth blocker: retrying immediately will not help.
     err = row["last_failure_error"]
