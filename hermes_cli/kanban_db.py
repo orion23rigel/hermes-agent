@@ -261,6 +261,9 @@ KANBAN_RATE_LIMIT_EXIT_CODE = 75
 # worker crashes so the dispatcher can persist and back off the right outcome.
 KANBAN_RETRYABLE_FAILURE_EXIT_CODE = 74
 
+# Retryable provider failures consume the normal bounded failure budget but
+# are spaced out so an unhealthy endpoint cannot hot-loop dispatcher workers.
+DEFAULT_RETRYABLE_FAILURE_COOLDOWN_SECONDS = 60
 
 # BSD EX_CONFIG. A worker uses this only when its fail-closed startup
 # preflight cannot build a valid execution route; dispatcher retries cannot
@@ -8898,6 +8901,12 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
         ``_RESPAWN_GUARD_PR_WINDOW`` seconds).  A prior worker already
         opened a PR; re-spawning risks a duplicate PR on the same task.
 
+    ``"retryable_failure_cooldown"``
+        The latest worker run ended after a retryable provider request stall.
+        Defer for ``DEFAULT_RETRYABLE_FAILURE_COOLDOWN_SECONDS`` so a degraded
+        endpoint cannot hot-loop workers while the normal bounded failure
+        counter decides whether the task eventually gives up.
+
     Stale / dead claim locks are NOT a guard reason — they are handled
     by ``release_stale_claims`` and ``detect_crashed_workers`` which
     reset the task to ``ready`` only after verifying the lock is
@@ -8948,6 +8957,16 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
         # crash/completion supersedes it.
         return None
 
+    if (
+        latest_run is not None
+        and latest_run["outcome"] == "retryable_failure"
+    ):
+        ended_at = latest_run["ended_at"]
+        if (
+            ended_at is not None
+            and (now - int(ended_at)) < DEFAULT_RETRYABLE_FAILURE_COOLDOWN_SECONDS
+        ):
+            return "retryable_failure_cooldown"
 
     # 2. Quota / auth blocker: retrying immediately will not help.
     err = row["last_failure_error"]

@@ -1011,6 +1011,42 @@ def test_retryable_failure_requeues_counts_and_trips_bounded_breaker(
         assert outcomes == ["retryable_failure", "retryable_failure"]
 
 
+def test_respawn_guard_defers_retryable_failure_for_fixed_cooldown(
+    kanban_home, monkeypatch,
+):
+    import hermes_cli.kanban_db as _kb
+
+    now = 7_000_000
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="retryable-guard", assignee="a")
+        kb.claim_task(conn, tid)
+        run_id = kb.get_task(conn, tid).current_run_id
+        conn.execute(
+            "UPDATE task_runs SET outcome='retryable_failure', "
+            "status='retryable_failure', ended_at=? WHERE id=?",
+            (now, run_id),
+        )
+        conn.execute(
+            "UPDATE tasks SET status='ready', current_run_id=NULL, "
+            "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL, "
+            "last_failure_error=? WHERE id=?",
+            ("retryable provider request stall", tid),
+        )
+        conn.commit()
+
+        monkeypatch.setattr(_kb.time, "time", lambda: now + 10)
+        assert (
+            kb.check_respawn_guard(conn, tid)
+            == "retryable_failure_cooldown"
+        )
+
+        monkeypatch.setattr(
+            _kb.time,
+            "time",
+            lambda: now + _kb.DEFAULT_RETRYABLE_FAILURE_COOLDOWN_SECONDS + 1,
+        )
+        assert kb.check_respawn_guard(conn, tid) is None
+
 
 def test_real_crash_still_counts_and_trips_breaker(kanban_home, monkeypatch):
     """Sanity: a genuine non-zero crash (not the sentinel) still increments
