@@ -256,6 +256,10 @@ DEFAULT_CRASH_GRACE_SECONDS = 30
 # conventional "temporary failure, retry later" code, and well clear of the
 # 0/1/2 codes the worker uses for success / generic failure / usage error.
 KANBAN_RATE_LIMIT_EXIT_CODE = 75
+
+# Retryable provider request failure, distinct from quota walls and generic
+# worker crashes so the dispatcher can persist and back off the right outcome.
+KANBAN_RETRYABLE_FAILURE_EXIT_CODE = 74
 # BSD EX_CONFIG. A worker uses this only when its fail-closed startup
 # preflight cannot build a valid execution route; dispatcher retries cannot
 # repair profile/model/sandbox configuration, so this trips immediately.
@@ -7585,6 +7589,8 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
       ``KANBAN_PERMANENT_FAILURE_EXIT_CODE``. Startup preflight found a
       proven structural worker-contract defect; retrying unchanged state cannot
       help and the task is blocked on this first observation.
+    * ``"retryable_failure"`` — ``WIFEXITED`` with status
+      ``KANBAN_RETRYABLE_FAILURE_EXIT_CODE``.
     * ``"nonzero_exit"`` — ``WIFEXITED`` with non-zero status. Real error.
     * ``"signaled"`` — ``WIFSIGNALED`` (OOM killer, SIGKILL, etc). Real crash.
     * ``"unknown"`` — pid was not in the reap registry (either reaped by
@@ -7606,6 +7612,8 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
                 return ("clean_exit", 0)
             if code == KANBAN_RATE_LIMIT_EXIT_CODE:
                 return ("rate_limited", code)
+            if code == KANBAN_RETRYABLE_FAILURE_EXIT_CODE:
+                return ("retryable_failure", code)
             if code == KANBAN_PERMANENT_FAILURE_EXIT_CODE:
                 return ("permanent_failure", code)
             if code == KANBAN_PROTOCOL_FAILURE_EXIT_CODE:

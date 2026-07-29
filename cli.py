@@ -1345,6 +1345,31 @@ def _finalize_single_query(cli) -> None:
         cli._release_active_session()
 
 
+def _single_query_exit_code(result: object, *, kanban_worker: bool) -> int:
+    """Return the automation exit code for a quiet single-query result."""
+    if not isinstance(result, dict) or not result.get("failed"):
+        return 0
+    if not kanban_worker:
+        return 1
+
+    try:
+        from hermes_cli.kanban_db import (
+            KANBAN_RATE_LIMIT_EXIT_CODE,
+            KANBAN_RETRYABLE_FAILURE_EXIT_CODE,
+        )
+    except Exception:
+        return 1
+
+    if (
+        result.get("error_code") == "provider_request_stalled"
+        and result.get("retryable") is True
+    ):
+        return KANBAN_RETRYABLE_FAILURE_EXIT_CODE
+    if result.get("failure_reason") in ("rate_limit", "billing"):
+        return KANBAN_RATE_LIMIT_EXIT_CODE
+    return 1
+
+
 def _reset_terminal_input_modes_on_exit() -> None:
     """Best-effort: disable focus reporting + mouse tracking on TUI exit so they
     don't leak into the next shell session sharing the tab.
@@ -17663,19 +17688,10 @@ def main(
                         # 5-hour quota window can't trip the circuit breaker and
                         # permanently block the card. Non-kanban runs keep the
                         # plain 0/1 contract automation wrappers expect.
-                        _exit_code = 0
-                        if isinstance(result, dict) and result.get("failed"):
-                            _exit_code = 1
-                            if os.environ.get("HERMES_KANBAN_TASK") and result.get(
-                                "failure_reason"
-                            ) in ("rate_limit", "billing"):
-                                try:
-                                    from hermes_cli.kanban_db import (
-                                        KANBAN_RATE_LIMIT_EXIT_CODE as _RL_CODE,
-                                    )
-                                    _exit_code = _RL_CODE
-                                except Exception:
-                                    _exit_code = 1
+                        _exit_code = _single_query_exit_code(
+                            result,
+                            kanban_worker=bool(os.environ.get("HERMES_KANBAN_TASK")),
+                        )
                         _exit_code = _kanban_worker_terminal_exit_code(
                             _exit_code
                         )

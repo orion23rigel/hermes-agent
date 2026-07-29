@@ -892,6 +892,20 @@ def test_classify_worker_exit_recognizes_rate_limit_sentinel(kanban_home):
     assert _kb._classify_worker_exit(pid + 1) == ("nonzero_exit", 1)
 
 
+def test_classify_worker_exit_recognizes_retryable_failure_sentinel(kanban_home):
+    import hermes_cli.kanban_db as _kb
+
+    pid = 31338
+    _kb._record_worker_exit(
+        pid, _exited_status(_kb.KANBAN_RETRYABLE_FAILURE_EXIT_CODE)
+    )
+
+    assert _kb._classify_worker_exit(pid) == (
+        "retryable_failure",
+        _kb.KANBAN_RETRYABLE_FAILURE_EXIT_CODE,
+    )
+
+
 def test_rate_limit_exit_requeues_without_counting_failure(
     kanban_home, monkeypatch,
 ):

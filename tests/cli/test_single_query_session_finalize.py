@@ -363,3 +363,52 @@ def test_human_worker_init_failure_honors_classified_exit_marker(
         cli_mod.main(query="hello", quiet=False, toolsets="terminal")
 
     assert exc_info.value.code == init_exit_code
+
+
+@pytest.mark.parametrize(
+    ("result", "kanban_worker", "expected"),
+    [
+        ({}, False, 0),
+        ({}, True, 0),
+        ({"failed": True}, False, 1),
+        ({"failed": True}, True, 1),
+        ({"failed": True, "failure_reason": "rate_limit"}, False, 1),
+        ({"failed": True, "failure_reason": "rate_limit"}, True, 75),
+        ({"failed": True, "failure_reason": "billing"}, True, 75),
+        (
+            {
+                "failed": True,
+                "error_code": "provider_request_stalled",
+                "retryable": True,
+            },
+            False,
+            1,
+        ),
+        (
+            {
+                "failed": True,
+                "error_code": "provider_request_stalled",
+                "retryable": True,
+            },
+            True,
+            74,
+        ),
+        (
+            {
+                "failed": True,
+                "error_code": "provider_request_stalled",
+                "retryable": False,
+            },
+            True,
+            1,
+        ),
+    ],
+)
+def test_single_query_exit_code_is_scoped_to_kanban_workers(
+    result, kanban_worker, expected
+):
+    import cli as cli_mod
+
+    assert cli_mod._single_query_exit_code(
+        result, kanban_worker=kanban_worker
+    ) == expected
