@@ -751,9 +751,10 @@ hermes kanban runs t_abcd
 | `heartbeat` | `{note?}` | Worker 在长时间操作期间调用 `hermes kanban heartbeat $TASK` 发出存活信号。 |
 | `reclaimed` | `{stale_lock}` | 认领 TTL 在完成前过期；任务返回 `ready`。 |
 | `crashed` | `{pid, claimer}` | Worker PID 不再存活但 TTL 尚未过期。 |
+| `retryable_failure` | `{pid, claimer, exit_kind, exit_code}` | Worker 因结构化 provider 请求停滞以状态 `74` 退出。运行记录持久化为 `retryable_failure`；低于失败上限时任务返回 `ready`，预算耗尽时任务被阻塞。它会消耗普通的有界失败预算，并与通用崩溃分开报告。 |
 | `timed_out` | `{pid, elapsed_seconds, limit_seconds, sigkill}` | 超过 `max_runtime_seconds`；调度器发送 SIGTERM（5 秒宽限后发送 SIGKILL）并重新排队。 |
 | `stale` | `{elapsed_seconds, last_heartbeat_at, heartbeat_age_seconds, timeout_seconds, pid, terminated}` | 任务运行时间超过 `kanban.dispatch_stale_timeout_seconds`（默认 4 小时）**且**最近一小时内没有 `kanban_heartbeat`。调度器向本地 worker（如有）发送 SIGTERM，将任务重置为 `ready` 重新调度。**不**增加失败计数器（stale 是调度器端的缺席检测，不是 worker 故障）。运行长时间操作的 Worker 应至少每小时调用一次 `kanban_heartbeat` 以避免此情况。 |
-| `respawn_guarded` | `{reason}` | 调度器拒绝在本 tick 重新启动此就绪任务。原因：`blocker_auth`（上次失败是配额/认证/429 错误 —— 等待速率窗口重置）、`recent_success`（最近一小时内有完成的运行 —— 在重新运行前等待审查）、`active_pr`（最近的评论中出现 GitHub PR URL —— 先前的 worker 已经打开了 PR）。任务保持在 `ready`；下一个 tick 有另一次启动机会。如果底层条件持续存在，正常的 `consecutive_failures` 熔断器将在 `failure_limit` 次失败后通过 `gave_up` 自动阻塞。 |
+| `respawn_guarded` | `{reason}` | 调度器拒绝在本 tick 重新启动此就绪任务。原因包括 `retryable_failure_cooldown`（provider 停滞后的固定 60 秒冷却）、`blocker_auth`（配额/认证/429）、`recent_success` 和 `active_pr`。任务保持 `ready`，后续 tick 可再次尝试。可重试 provider 停滞仍会消耗普通 `consecutive_failures` 预算，并最终通过 `gave_up` 自动阻塞。 |
 | `spawn_failed` | `{error, failures}` | 一次启动尝试失败（PATH 缺失、工作区无法挂载等）。计数器递增；任务返回 `ready` 重试。 |
 | `protocol_violation` | `{pid, claimer, exit_code}` | Worker 在任务仍处于 `running` 状态时成功退出，通常是因为它回答了问题而没有调用 `kanban_complete` 或 `kanban_block`。调度器还会立即发出 `gave_up` 并自动阻塞，而不是重试。 |
 | `gave_up` | `{failures, effective_limit, limit_source, error}` | N 次连续不成功尝试后熔断器触发。任务以最后一个错误自动阻塞。有效限制解析为任务 `max_retries`，然后是调度器 `failure_limit` / `kanban.failure_limit`，然后是内置默认值。 |

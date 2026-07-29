@@ -234,7 +234,7 @@ HERMES_STREAM_READ_TIMEOUT=1800
 | 超时类型 | 默认值 | 本地自动调整 | 环境变量覆盖 |
 |---------|---------|----------------------|------------------|
 | 流式读取（socket 级别） | 120s | 提升至 1800s | `HERMES_STREAM_READ_TIMEOUT` |
-| 停滞流检测 | 180s | 完全禁用 | `HERMES_STREAM_STALE_TIMEOUT` |
-| API 调用（非流式） | 1800s | 无需调整 | `HERMES_API_TIMEOUT` |
+| 停滞流检测 | 180s | 提升至 900s | `HERMES_STREAM_STALE_TIMEOUT` / `HERMES_LOCAL_STREAM_STALE_TIMEOUT` |
+| 绝对 provider 尝试 | 1800s | 不自动调整 | `HERMES_API_TIMEOUT` |
 
-流式读取超时最容易引发问题——它是接收下一个数据块的 socket 级别截止时间。在大上下文的预填充（prefill）阶段，本地模型可能在处理 prompt 时数分钟内没有任何输出。自动检测机制会透明地处理这一情况。
+流式读取超时是接收下一个数据块的 socket 级别截止时间。在大上下文的预填充（prefill）阶段，本地模型可能在处理 prompt 时数分钟内没有任何输出。本地端点自动检测会提高读取超时和陈旧流无活动窗口，但不会延长绝对 provider 尝试截止时间。如果一次物理尝试确实需要超过 30 分钟，请提高 `HERMES_API_TIMEOUT` 或配置 `providers.<id>.request_timeout_seconds`；已接收字节不会重置该墙钟预算。

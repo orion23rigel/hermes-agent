@@ -107,27 +107,27 @@ model:
   #       X-Client-Name: "hermes-agent"
 
 # Named provider overrides (optional)
-# Use this for per-provider request timeouts, non-stream stale timeouts,
+# Use this for per-provider absolute request deadlines, stale timeouts,
 # and per-model exceptions.
-# Applies to the primary turn client on every api_mode (OpenAI-wire, native
-# Anthropic, and Anthropic-compatible providers), the fallback chain, and
-# client rebuilds during credential rotation.  For OpenAI-wire chat
-# completions (streaming and non-streaming) the configured value is also
-# used as the per-request ``timeout=`` kwarg so it wins over the legacy
-# HERMES_API_TIMEOUT env var (which still applies when no config is set).
-# ``stale_timeout_seconds`` controls the non-streaming stale-call detector and
-# wins over the legacy HERMES_API_CALL_STALE_TIMEOUT env var. Leaving these
-# unset keeps the legacy defaults (HERMES_API_TIMEOUT=1800s,
-# HERMES_API_CALL_STALE_TIMEOUT=90s, native Anthropic 900s). The
-# implicit non-stream stale detector is auto-disabled for local endpoints
-# and can scale upward for very large contexts.
-#
-# Not currently wired for AWS Bedrock (bedrock_converse + AnthropicBedrock
-# SDK paths) — those use boto3 with its own timeout configuration.
+# ``request_timeout_seconds`` is a fixed wall-clock budget for one physical
+# provider attempt on every api_mode, including streaming, native Anthropic,
+# and Bedrock. Received bytes and keep-alives do not extend it. Retries,
+# fallback targets, and credential-rotation rebuilds start fresh attempts.
+# For OpenAI-wire calls it is also used as the per-request ``timeout=`` kwarg,
+# so it wins over HERMES_API_TIMEOUT (used when no config value is set).
+# ``stale_timeout_seconds`` controls the streaming and non-streaming inactivity
+# detectors; progress may reset this detector but never the absolute request
+# deadline. It wins over HERMES_API_CALL_STALE_TIMEOUT for non-stream calls.
+# Leaving these unset keeps the 1800s absolute attempt deadline; individual
+# provider SDKs may enforce shorter transport timeouts (native Anthropic uses
+# 900s). The 90s non-stream stale
+# default, and the 180s streaming stale default. Implicit non-stream stale
+# detection is disabled for local endpoints; implicit local stream stale
+# detection uses 900s. Large/slow local models can raise the configured values.
 #
 # providers:
 #   ollama-local:
-#     request_timeout_seconds: 300   # Longer timeout for local cold-starts
+#     request_timeout_seconds: 3600  # Absolute budget for slow local attempts
 #     stale_timeout_seconds: 900     # Explicitly re-enable stale detection on local endpoints
 #   anthropic:
 #     request_timeout_seconds: 30    # Fast-fail cloud requests
@@ -137,7 +137,7 @@ model:
 #   openai-codex:
 #     models:
 #       gpt-5.4:
-#         stale_timeout_seconds: 1800  # Longer non-stream stale timeout for slow large-context turns
+#         stale_timeout_seconds: 1800  # Longer inactivity budget for slow large-context turns
 
 # =============================================================================
 # OpenRouter Provider Routing (only applies when using OpenRouter)

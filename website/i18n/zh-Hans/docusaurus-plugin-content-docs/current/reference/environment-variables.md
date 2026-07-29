@@ -542,10 +542,11 @@ Graph 事件（Teams 会议、日历、聊天等）的入站变更通知监听�
 | `HERMES_QUIET` | 抑制非必要输出（`true`/`false`） |
 | `CODEX_HOME` | 启用 [Codex 应用服务器运行时](../user-guide/features/codex-app-server-runtime)时，覆盖 Codex CLI 读取其配置 + 认证的目录（默认：`~/.codex`）。Hermes 的迁移将托管块写入 `<CODEX_HOME>/config.toml`。 |
 | `HERMES_KANBAN_TASK` | kanban 调度器生成工作进程时设置（任务 UUID）。工作进程和生成的 `hermes-tools` MCP 子进程继承它，以便 kanban 工具正确门控。请勿手动设置。 |
-| `HERMES_API_TIMEOUT` | LLM API 调用超时（秒，默认：`1800`） |
-| `HERMES_API_CALL_STALE_TIMEOUT` | 非流式过期调用超时（秒，默认：`300`）。未设置时对本地提供商自动禁用。也可通过 `config.yaml` 中的 `providers.<id>.stale_timeout_seconds` 或 `providers.<id>.models.<model>.stale_timeout_seconds` 配置。 |
+| `HERMES_API_TIMEOUT` | 一次物理 LLM provider 尝试的绝对墙钟截止时间（秒，默认：`1800`）。适用于流式和非流式请求，进度不会重置它。Provider/模型 `request_timeout_seconds` 可覆盖此值。Provider SDK 可能另行执行更短的传输超时（原生 Anthropic 默认为 `900` 秒）。 |
+| `HERMES_API_CALL_STALE_TIMEOUT` | 非流式陈旧调用无活动超时（秒，默认：`90`）。未设置时对本地 provider 自动禁用，并可针对超大上下文向上调整。也可通过 `config.yaml` 中的 `providers.<id>.stale_timeout_seconds` 或 `providers.<id>.models.<model>.stale_timeout_seconds` 配置。 |
 | `HERMES_STREAM_READ_TIMEOUT` | 流式 socket 读取超时（秒，默认：`120`）。对本地提供商自动增大到 `HERMES_API_TIMEOUT`。如果本地 LLM 在长代码生成期间超时，请增大此值。 |
-| `HERMES_STREAM_STALE_TIMEOUT` | 过期流检测超时（秒，默认：`180`）。对本地提供商自动禁用。在此窗口内无块到达时触发连接终止。 |
+| `HERMES_STREAM_STALE_TIMEOUT` | 陈旧流无活动超时（秒，默认：`180`）。保持隐式时，本地 provider 改用有限的 `HERMES_LOCAL_STREAM_STALE_TIMEOUT` 默认值。有效数据块会重置该检测器，但不会重置绝对 provider 尝试截止时间。 |
+| `HERMES_LOCAL_STREAM_STALE_TIMEOUT` | 本地 provider 的陈旧流上限（秒，默认：`900`）。当基础陈旧超时保持默认且检测到本地端点时使用，避免失效的本地服务器无限挂起。也可通过 `agent.local_stream_stale_timeout` 配置。 |
 | `HERMES_STREAM_RETRIES` | 瞬时网络错误时的流中重连尝试次数（默认：`3`）。 |
 | `HERMES_AGENT_TIMEOUT` | gateway 中运行 agent 的不活动超时（秒，默认：`900`）。每次工具调用和流 token 时重置。设为 `0` 可禁用。 |
 | `HERMES_AGENT_TIMEOUT_WARNING` | Gateway：不活动超过此秒数后发送警告消息（默认：`HERMES_AGENT_TIMEOUT` 的 75%）。 |

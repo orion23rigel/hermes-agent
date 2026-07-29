@@ -75,11 +75,11 @@ delegation:
 
 ### Provider 超时
 
-可以为 provider 设置 `providers.<id>.request_timeout_seconds` 作为全局请求超时，以及 `providers.<id>.models.<model>.timeout_seconds` 作为特定模型的覆盖值。适用于每种传输方式（OpenAI-wire、原生 Anthropic、Anthropic 兼容）上的主轮次客户端、回退链、凭据轮换后的重建，以及（对于 OpenAI-wire）每请求超时 kwarg —— 因此配置值优先于旧版 `HERMES_API_TIMEOUT` 环境变量。
+可以为 provider 设置 `providers.<id>.request_timeout_seconds` 作为全局绝对请求截止时间，以及 `providers.<id>.models.<model>.timeout_seconds` 作为特定模型的覆盖值。该值是一次物理 provider 尝试的固定墙钟时间预算，适用于所有传输方式，包括流式、原生 Anthropic 和 Bedrock。进度或已接收字节不会延长它。重试、回退目标和凭据轮换后的重建都会开始新的物理尝试并获得新的截止时间。对于 OpenAI-wire 调用，它也作为每请求超时 kwarg，因此优先于旧版 `HERMES_API_TIMEOUT` 环境变量。
 
-还可以设置 `providers.<id>.stale_timeout_seconds` 用于非流式陈旧调用检测器，以及 `providers.<id>.models.<model>.stale_timeout_seconds` 作为特定模型的覆盖值。此值优先于旧版 `HERMES_API_CALL_STALE_TIMEOUT` 环境变量。
+还可以设置 `providers.<id>.stale_timeout_seconds` 用于流式和非流式无活动检测器，以及 `providers.<id>.models.<model>.stale_timeout_seconds` 作为特定模型的覆盖值。有效进度可以重置无活动检测器，但不能延长绝对请求截止时间。对于非流式调用，此值优先于旧版 `HERMES_API_CALL_STALE_TIMEOUT` 环境变量。
 
-不设置这些值将保持旧版默认值（`HERMES_API_TIMEOUT=1800`s、`HERMES_API_CALL_STALE_TIMEOUT=90`s、原生 Anthropic 900s）。隐式的非流式 stale 检测会在本地端点上自动禁用，并且会在超大上下文下自动放宽。目前不适用于 AWS Bedrock（`bedrock_converse` 和 AnthropicBedrock SDK 路径均使用 boto3 及其自身的超时配置）。请参阅 [`cli-config.yaml.example`](https://github.com/NousResearch/hermes-agent/blob/main/cli-config.yaml.example) 中的注释示例。
+不设置这些值将保留 1800s 的绝对尝试截止时间、90s 的非流式 stale 默认值和 180s 的流式 stale 默认值。Provider SDK 可能另行执行更短的传输超时（原生 Anthropic 默认为 900s）。隐式非流式 stale 检测在本地端点上禁用，而本地流式检测使用有限的 900s stale 默认值。慢速推理模型或本地模型可以提高配置值。请参阅 [`cli-config.yaml.example`](https://github.com/NousResearch/hermes-agent/blob/main/cli-config.yaml.example) 中的注释示例。
 
 ## 终端后端配置
 
@@ -653,20 +653,22 @@ agent:
 
 ### API 超时
 
-Hermes 对流式传输有单独的超时层，以及用于非流式调用的陈旧检测器。陈旧检测器仅在您将其保留为隐式默认值时才会自动调整本地 provider。
+Hermes 将固定的每次尝试请求截止时间与流式 Socket 读取和无活动限制结合使用。无活动限制可能更早触发，但进度永远不会延长固定请求截止时间。隐式 stale 默认值会针对本地 provider 自动调整。
 
 | 超时 | 默认值 | 本地 providers | 配置/环境变量 |
 |---------|---------|----------------|--------------|
 | Socket 读取超时 | 120s | 自动提升至 1800s | `HERMES_STREAM_READ_TIMEOUT` |
-| 陈旧流检测 | 180s | 自动禁用 | `HERMES_STREAM_STALE_TIMEOUT` |
-| 陈旧非流检测 | 300s | 保持隐式时自动禁用 | `providers.<id>.stale_timeout_seconds` 或 `HERMES_API_CALL_STALE_TIMEOUT` |
-| API 调用（非流式） | 1800s | 不变 | `providers.<id>.request_timeout_seconds` / `timeout_seconds` 或 `HERMES_API_TIMEOUT` |
+| 陈旧流检测 | 180s | 保持隐式时为 900s | `providers.<id>.stale_timeout_seconds` 或 `HERMES_STREAM_STALE_TIMEOUT` |
+| 陈旧非流检测 | 90s | 保持隐式时自动禁用 | `providers.<id>.stale_timeout_seconds` 或 `HERMES_API_CALL_STALE_TIMEOUT` |
+| 绝对 provider 尝试 | 1800s | 不变 | `providers.<id>.request_timeout_seconds` / `timeout_seconds` 或 `HERMES_API_TIMEOUT` |
 
 **Socket 读取超时**控制 httpx 等待 provider 下一个数据块的时间。本地 LLM 在大上下文上预填充可能需要几分钟才能产生第一个 token，因此当 Hermes 检测到本地端点时，会将此值提升至 30 分钟。如果您显式设置 `HERMES_STREAM_READ_TIMEOUT`，无论端点检测如何，始终使用该值。
 
-**陈旧流检测**终止接收 SSE 保活 ping 但没有实际内容的连接。对于本地 providers，这完全禁用，因为它们在预填充期间不发送保活 ping。
+**陈旧流检测**终止没有接收有效内容的连接，即使 SSE 保活 ping 仍在继续。本地 provider 使用有限的 900 秒隐式默认值，以允许长时间预填充。
 
 **陈旧非流检测**终止长时间没有响应的非流式调用。默认情况下，Hermes 在本地端点上禁用此功能，以避免长时间预填充期间的误报。如果您显式设置 `providers.<id>.stale_timeout_seconds`、`providers.<id>.models.<model>.stale_timeout_seconds` 或 `HERMES_API_CALL_STALE_TIMEOUT`，即使在本地端点上也会遵守该显式值。
+
+**绝对 provider 尝试截止时间**限制总墙钟时间，包括持续少量传输字节的流。它分别应用于每次物理重试或回退尝试，并且永远不会因进度而重置。Provider SDK 可能先执行更短的传输超时；原生 Anthropic 默认为 900 秒。
 
 ## 上下文压力警告
 

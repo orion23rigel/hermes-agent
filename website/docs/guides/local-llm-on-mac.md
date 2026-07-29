@@ -234,7 +234,7 @@ HERMES_STREAM_READ_TIMEOUT=1800
 | Timeout | Default | Local auto-adjustment | Env var override |
 |---------|---------|----------------------|------------------|
 | Stream read (socket-level) | 120s | Raised to 1800s | `HERMES_STREAM_READ_TIMEOUT` |
-| Stale stream detection | 180s | Disabled entirely | `HERMES_STREAM_STALE_TIMEOUT` |
-| API call (non-streaming) | 1800s | No change needed | `HERMES_API_TIMEOUT` |
+| Stale stream detection | 180s | Raised to 900s | `HERMES_STREAM_STALE_TIMEOUT` / `HERMES_LOCAL_STREAM_STALE_TIMEOUT` |
+| Absolute provider attempt | 1800s | No automatic change | `HERMES_API_TIMEOUT` |
 
-The stream read timeout is the one most likely to cause issues — it's the socket-level deadline for receiving the next chunk of data. During prefill on large contexts, local models may produce no output for minutes while processing the prompt. The auto-detection handles this transparently.
+The stream read timeout is the socket-level deadline for receiving the next chunk of data. During prefill on large contexts, local models may produce no output for minutes while processing the prompt. Local auto-detection raises that read timeout and the stale-stream inactivity window, but it does not extend the absolute provider-attempt deadline. If a physical attempt legitimately needs more than 30 minutes, raise `HERMES_API_TIMEOUT` or configure `providers.<id>.request_timeout_seconds`; received bytes never reset that wall-clock budget.
