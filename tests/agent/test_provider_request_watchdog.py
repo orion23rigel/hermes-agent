@@ -1,5 +1,7 @@
 """Tests for the provider request deadline error contract."""
 
+import pytest
+
 from agent.provider_request_watchdog import (
     PROVIDER_REQUEST_STALLED,
     ProviderRequestMonitor,
@@ -209,3 +211,30 @@ def test_monitor_callback_failure_is_fail_soft_and_payload_is_allowlisted():
         "bytes_received",
         "error_code",
     }
+
+
+@pytest.mark.parametrize("terminal", ["complete", "fail"])
+def test_terminal_transition_after_deadline_becomes_structured_stall(terminal):
+    clock = _Clock()
+    events = []
+    monitor = ProviderRequestMonitor(
+        provider="p",
+        model="m",
+        timeout_seconds=5,
+        clock=clock,
+        event_callback=lambda event, payload: events.append((event, payload)),
+    )
+    monitor.begin_attempt(api_request_id="req-late-terminal")
+    clock.now += 6
+
+    with pytest.raises(ProviderRequestStalledError):
+        if terminal == "complete":
+            monitor.complete()
+        else:
+            monitor.fail(OSError("late transport failure"))
+
+    assert [event for event, _ in events] == [
+        "provider_request.started",
+        "provider_request.failed",
+    ]
+    assert events[-1][1]["error_code"] == "provider_request_stalled"

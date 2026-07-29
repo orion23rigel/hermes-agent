@@ -508,6 +508,14 @@ def should_use_direct_api_call(agent) -> bool:
     return getattr(agent, "platform", None) == "subagent"
 
 
+def _provider_request_timeout_seconds(agent) -> float:
+    """Resolve the absolute attempt deadline for real agents and test doubles."""
+    resolver = getattr(agent, "_resolved_api_call_timeout", None)
+    if callable(resolver):
+        return float(resolver())
+    return env_float("HERMES_API_TIMEOUT", 1800.0)
+
+
 def direct_api_call(agent, api_kwargs: dict):
     """Run a non-streaming LLM call inline on the conversation thread.
 
@@ -523,6 +531,24 @@ def direct_api_call(agent, api_kwargs: dict):
     agent._touch_activity("waiting for non-streaming API response")
     request_client_holder = {"client": None}
     request_client_lock = threading.Lock()
+    from agent.provider_request_watchdog import (
+        ProviderRequestMonitor,
+        ProviderRequestStalledError,
+    )
+
+    request_monitor = ProviderRequestMonitor(
+        provider=str(getattr(agent, "provider", "") or ""),
+        model=str(getattr(agent, "model", "") or ""),
+        timeout_seconds=_provider_request_timeout_seconds(agent),
+        event_callback=getattr(agent, "event_callback", None),
+    )
+    request_id = str(
+        getattr(agent, "_current_api_request_id", "")
+        or f"direct-{threading.get_ident()}-{time.monotonic_ns()}"
+    )
+    retry_count = int(getattr(agent, "_current_api_retry_count", 0) or 0)
+    deadline_error: dict[str, ProviderRequestStalledError | None] = {"value": None}
+    deadline_ready = threading.Event()
 
     def _abort_active_request(reason: str) -> None:
         """Abort the inline request from a watchdog/interrupt thread."""
@@ -552,21 +578,60 @@ def direct_api_call(agent, api_kwargs: dict):
     # after an error or interrupt the wire client is really closed so the
     # retry builds a fresh pool (see _REQUEST_CLIENT_REUSE_REASONS).
     succeeded = False
+    request_monitor.begin_attempt(
+        api_request_id=request_id,
+        retry_count=retry_count,
+    )
+
+    def _deadline_abort() -> None:
+        try:
+            request_monitor.check_deadline()
+        except ProviderRequestStalledError as exc:
+            deadline_error["value"] = exc
+            deadline_ready.set()
+            _abort_active_request("provider_request_deadline")
+
+    deadline_timer = threading.Timer(
+        request_monitor.timeout_seconds,
+        _deadline_abort,
+    )
+    deadline_timer.daemon = True
+    deadline_timer.start()
     try:
         response = _dispatch_nonstreaming_api_request(
             agent, api_kwargs, make_client=_make_client
         )
-    except Exception:
+    except Exception as exc:
+        if deadline_error["value"] is not None:
+            raise deadline_error["value"] from None
         if getattr(agent, "_interrupt_requested", False):
             raise InterruptedError("Agent interrupted during API call") from None
+        try:
+            won_terminal = request_monitor.fail(exc)
+        except ProviderRequestStalledError:
+            raise
+        if not won_terminal:
+            deadline_ready.wait(timeout=1.0)
+            if deadline_error["value"] is not None:
+                raise deadline_error["value"] from None
         raise
     else:
+        if deadline_error["value"] is not None:
+            raise deadline_error["value"]
         if getattr(agent, "_interrupt_requested", False):
             raise InterruptedError("Agent interrupted during API call")
         _reset_stale_streak(agent)
+        won_terminal = request_monitor.complete()
+        if not won_terminal:
+            deadline_ready.wait(timeout=1.0)
+            if deadline_error["value"] is not None:
+                raise deadline_error["value"]
+            raise RuntimeError("provider request terminal race without outcome")
         succeeded = True
         return response
     finally:
+        deadline_timer.cancel()
+        deadline_timer.join(timeout=1.0)
         if getattr(agent, "_active_request_abort", None) is _abort_active_request:
             agent._active_request_abort = None
         with request_client_lock:
@@ -679,6 +744,24 @@ def interruptible_api_call(agent, api_kwargs: dict):
         else:
             agent._close_request_openai_client(request_client, reason=reason)
 
+    from agent.provider_request_watchdog import (
+        ProviderRequestMonitor,
+        ProviderRequestStalledError,
+    )
+
+    request_monitor = ProviderRequestMonitor(
+        provider=str(getattr(agent, "provider", "") or ""),
+        model=str(getattr(agent, "model", "") or ""),
+        timeout_seconds=_provider_request_timeout_seconds(agent),
+        event_callback=getattr(agent, "event_callback", None),
+    )
+    request_id = str(
+        getattr(agent, "_current_api_request_id", "")
+        or f"nonstream-{threading.get_ident()}-{time.monotonic_ns()}"
+    )
+    retry_count = int(getattr(agent, "_current_api_retry_count", 0) or 0)
+    deadline_error: dict[str, ProviderRequestStalledError | None] = {"value": None}
+
     def _call():
         try:
             # _set_request_client registers each per-request client with the
@@ -686,7 +769,7 @@ def interruptible_api_call(agent, api_kwargs: dict):
             # builds it via this callback (openai- or anthropic-kind) so the
             # interrupt / stale-call detectors can force-close the worker's
             # connection without touching the shared client (#67142).
-            result["response"] = _dispatch_nonstreaming_api_request(
+            response = _dispatch_nonstreaming_api_request(
                 agent,
                 api_kwargs,
                 make_client=lambda reason, kind="openai": _set_request_client(
@@ -698,6 +781,8 @@ def interruptible_api_call(agent, api_kwargs: dict):
                     kind=kind,
                 ),
             )
+            if request_monitor.complete():
+                result["response"] = response
         except Exception as e:
             # If the request was cancelled by the main thread's interrupt
             # handler, the transport error is the expected consequence of our
@@ -710,7 +795,12 @@ def interruptible_api_call(agent, api_kwargs: dict):
                     type(e).__name__,
                 )
                 return
-            result["error"] = e
+            try:
+                request_monitor.fail(e)
+            except ProviderRequestStalledError as stall_error:
+                result["error"] = stall_error
+            else:
+                result["error"] = e
         finally:
             # Reuse reason only on a clean response; any other outcome —
             # error, or the cancel-swallow return above (which leaves both
@@ -847,12 +937,28 @@ def interruptible_api_call(agent, api_kwargs: dict):
     _call_start = time.time()
     agent._touch_activity("waiting for non-streaming API response")
 
+    request_monitor.begin_attempt(
+        api_request_id=request_id,
+        retry_count=retry_count,
+    )
     t = threading.Thread(target=_context_thread_target(_call), daemon=True)
     t.start()
     _poll_count = 0
     while t.is_alive():
         t.join(timeout=0.3)
         _poll_count += 1
+
+        try:
+            request_monitor.check_deadline()
+        except ProviderRequestStalledError as exc:
+            deadline_error["value"] = exc
+            _request_cancelled["value"] = True
+            try:
+                _close_request_client_once("provider_request_deadline")
+            except Exception:
+                pass
+            t.join(timeout=2.0)
+            break
 
         # Every ~30s: touch activity for the gateway inactivity monitor AND
         # rewrite the live spinner/status line so CLI/TUI/Desktop users see
@@ -1063,6 +1169,8 @@ def interruptible_api_call(agent, api_kwargs: dict):
             except Exception:
                 pass
             raise InterruptedError("Agent interrupted during API call")
+    if deadline_error["value"] is not None:
+        raise deadline_error["value"]
     if result["error"] is not None:
         raise result["error"]
     # Success — clear the circuit breaker (#58962): the provider proved

@@ -145,23 +145,47 @@ class ProviderRequestMonitor:
         self._emit("provider_request.failed", payload)
         raise error
 
-    def complete(self) -> None:
-        self._finish("provider_request.completed")
+    def complete(self) -> bool:
+        """Finish successfully unless the absolute deadline already elapsed."""
+        now = self._clock()
+        stall_error = None
+        with self._lock:
+            if self._started_at is None or self._terminal:
+                return False
+            self._terminal = True
+            if now - self._started_at >= self.timeout_seconds:
+                stall_error = self._stall_error_locked(now)
+                payload = self._payload_locked(
+                    now, error_code=stall_error.error_code
+                )
+                event = "provider_request.failed"
+            else:
+                payload = self._payload_locked(now)
+                event = "provider_request.completed"
+        self._emit(event, payload)
+        if stall_error is not None:
+            raise stall_error
+        return True
 
-    def fail(self, error: BaseException) -> None:
+    def fail(self, error: BaseException) -> bool:
+        """Finish with an error, giving an elapsed deadline precedence."""
+        now = self._clock()
+        stall_error = None
         error_code = _diagnostic_label(
             str(getattr(error, "error_code", "") or type(error).__name__)
         )
-        self._finish("provider_request.failed", error_code=error_code)
-
-    def _finish(self, event: str, *, error_code: str = "") -> None:
-        now = self._clock()
         with self._lock:
             if self._started_at is None or self._terminal:
-                return
+                return False
             self._terminal = True
+            if now - self._started_at >= self.timeout_seconds:
+                stall_error = self._stall_error_locked(now)
+                error_code = stall_error.error_code
             payload = self._payload_locked(now, error_code=error_code)
-        self._emit(event, payload)
+        self._emit("provider_request.failed", payload)
+        if stall_error is not None:
+            raise stall_error
+        return True
 
     def _stall_error_locked(self, now: float) -> ProviderRequestStalledError:
         assert self._started_at is not None
