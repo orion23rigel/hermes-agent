@@ -10,9 +10,20 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
+
+
+def _init_git_repo(path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        ["git", "init", "-b", "main", str(path)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1208,7 +1219,7 @@ def test_create_default_child_inherits_project_without_reusing_worktree(
     from hermes_cli import projects_db as pdb
 
     repo = tmp_path / "repo"
-    repo.mkdir()
+    _init_git_repo(repo)
     with pdb.connect_closing() as project_conn:
         project_id = pdb.create_project(
             project_conn, name="Isolated Project", folders=[str(repo)],
@@ -1266,7 +1277,7 @@ def test_create_cross_profile_project_children_keep_isolated_worktree_routing(
     profile_a.mkdir(parents=True)
     profile_b.mkdir(parents=True)
     repo = tmp_path / "repo"
-    repo.mkdir()
+    _init_git_repo(repo)
     shared_db = tmp_path / "shared-kanban.db"
 
     monkeypatch.setattr(_Path, "home", lambda: tmp_path)
@@ -1744,12 +1755,29 @@ def test_kanban_guidance_not_in_normal_prompt(monkeypatch, tmp_path):
 def test_kanban_guidance_in_worker_prompt(monkeypatch, tmp_path):
     """A worker session (HERMES_KANBAN_TASK set) MUST have the full
     lifecycle guidance in its system prompt."""
-    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_fake")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
     home = tmp_path / ".hermes"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
     from pathlib import Path as _P
     monkeypatch.setattr(_P, "home", lambda: tmp_path)
+    from hermes_cli import kanban_db as _kb
+
+    _kb.init_db()
+    with _kb.connect() as _conn:
+        _task_id = _kb.create_task(
+            _conn,
+            title="prompt contract",
+            workspace_kind="dir",
+            workspace_path=str(workspace),
+        )
+        _task = _kb.claim_task(_conn, _task_id)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", _task_id)
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(workspace))
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(_task.current_run_id))
+    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", str(_task.claim_lock))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(_kb.kanban_db_path()))
 
     from tools.registry import invalidate_check_fn_cache
     from model_tools import _clear_tool_defs_cache

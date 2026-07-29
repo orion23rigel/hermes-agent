@@ -228,3 +228,9 @@ def test_real_handler_uses_os_exit_for_kanban_workers():
         "raising KeyboardInterrupt orphans the process when non-daemon "
         "threads are alive (see #28181)"
     )
+    cleanup_pos = body.find("_cleanup_kb_vm(")
+    exit_pos = body.find("os._exit(0)", cleanup_pos)
+    assert cleanup_pos != -1 and exit_pos > cleanup_pos, (
+        "Kanban SIGTERM must synchronously remove the exact task sandbox "
+        "before forcing process exit"
+    )

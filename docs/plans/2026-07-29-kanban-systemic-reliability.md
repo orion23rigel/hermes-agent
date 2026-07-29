@@ -106,7 +106,7 @@ No new model tool is required. The narrow waist stays unchanged.
 | Repeated deterministic retries | Workspace/config errors have no typed classification | Permanent preflight/spawn errors block once; only transient errors retry |
 | Clean protocol exit | Critical runtime feasibility is lazy and failure does not imply a terminal task call | Eager Kanban startup preflight plus explicit terminal-state verification |
 | Duplicate DAG promotion | Archive doubles as dependency success and cancellation | Separate atomic supersede-subtree transition with replacement linkage |
-| Unreachable prerequisite work | Status edges carry no enforced Git/artifact provenance | Record and validate workspace, branch, base/result SHA, clean state, plan hash; start linear dependents from validated parent SHA |
+| Unreachable prerequisite work | Status edges carry no enforced Git/artifact provenance | Core records and validates workspace, branch, base/result SHA and clean state; policy supplies/checks plan hashes; linear dependents start from validated parent SHA |
 | Eager fan-out | Decomposer inserts the whole graph before foundation feasibility is known | Atomic graph preflight, explicit dependency edges, bounded wave policy |
 | Self-confirming CLI tests | Wrapper fake is the contract oracle | Run wrapper/parser integration against the real entry point in a temp `HERMES_HOME` |
 | Policy deployment drift | Deployment target differs from runtime profile target | Deploy/check actual role SOUL files atomically |
@@ -189,7 +189,8 @@ Worktree completion derives and validates, rather than trusting model prose:
 - expected/current branch;
 - base SHA and result `HEAD` SHA;
 - clean working tree;
-- optional plan SHA/hash supplied by policy.
+- optional plan SHA/hash supplied and checked by orchestration policy while
+  remaining preserved in run metadata.
 
 The trusted fields are stored in run metadata and surfaced to children.
 Completion fails closed on an uncommitted or mismatched worktree. A
@@ -199,17 +200,25 @@ reachable and are listed for deliberate cherry-pick/merge.
 
 ### 5. Diagnostics and compatibility
 
-Add diagnostics for invalid legacy workspace rows, superseded descendants,
-missing/mismatched handoff provenance, worker preflight failure, PID exhaustion,
-and stale behavior-setting keys in `.env` (key names only). Suggested actions
-are dry-run or explicit CLI commands. No automatic repair touches protected
-jobs, artifacts, or live tasks.
+Add a board diagnostic for invalid legacy workspace rows with an explicit
+dry-run supersede repair path. Supersession, provenance mismatch, worker
+preflight failure, and PID exhaustion are recorded as typed task/run events
+with deterministic/retryable flags and exact error text, so the existing
+run/log/diagnostic surfaces expose them without duplicating state. The stale
+profile `.env` premise was checked and rejected as the demonstrated cause:
+explicit `config.yaml` terminal values win during profile startup. No
+automatic repair touches protected jobs, artifacts, or live tasks.
 
 Existing boards migrate additively. Invalid legacy rows remain visible but
 cannot enter another retry loop; operators set a board default/recreate a
 valid replacement and atomically supersede the old subtree. Ordinary archive,
 scratch tasks, external/manual worker lanes, and normal Docker persistence
 retain their contracts.
+
+Implementation review also tightened two race boundaries beyond the initial
+outline: decomposition repeats workspace validation while holding the writer
+lock, and spawned PID registration compares task status, claim token, and run
+id so a concurrent supersede cannot resurrect a cancelled worker.
 
 ### 6. Orchestration policy
 

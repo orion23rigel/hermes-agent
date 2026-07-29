@@ -1196,6 +1196,14 @@ def _resolve_container_task_id(task_id: Optional[str]) -> str:
     session to spin up its own container.  Only overrides containing
     backend-specific image keys or ``env_type`` trigger isolation.
     """
+    kanban_task = (os.getenv("HERMES_KANBAN_TASK") or "").strip()
+    if kanban_task and os.getenv("HERMES_KANBAN_ISOLATED_SANDBOX") == "1":
+        # All tool calls in one worker share exactly one attempt-scoped
+        # sandbox, while different cards can never collapse onto the ordinary
+        # long-lived "default" container. Keep the key label-safe.
+        safe_task = re.sub(r"[^A-Za-z0-9_.-]+", "-", kanban_task).strip("-")
+        return f"kanban-{safe_task or 'task'}"
+
     _ISOLATION_KEYS = frozenset({
         "docker_image", "modal_image", "singularity_image",
         "daytona_image", "env_type",
@@ -1416,6 +1424,77 @@ def _get_env_config() -> Dict[str, Any]:
                         cwd, env_type, default_cwd)
             cwd = default_cwd
 
+    container_persistent = os.getenv(
+        "TERMINAL_CONTAINER_PERSISTENT", "true"
+    ).lower() in {"true", "1", "yes"}
+    docker_persist_across_processes = os.getenv(
+        "TERMINAL_DOCKER_PERSIST_ACROSS_PROCESSES", "true"
+    ).lower() in {"true", "1", "yes"}
+
+    # Dispatcher-spawned workers have a stricter lifecycle than normal chat:
+    # their sandbox belongs to one task attempt and must expose a path-stable
+    # checkout plus Git common-dir metadata. These internal env values are
+    # derived from the validated task; they deliberately override stale
+    # profile TERMINAL_* values that would otherwise re-enable shared state.
+    if (
+        docker_backend
+        and (os.getenv("HERMES_KANBAN_TASK") or "").strip()
+        and os.getenv("HERMES_KANBAN_ISOLATED_SANDBOX") == "1"
+    ):
+        raw_mounts = os.getenv("HERMES_KANBAN_RUNTIME_MOUNTS", "[]")
+        try:
+            kanban_mounts = json.loads(raw_mounts)
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                "Invalid HERMES_KANBAN_RUNTIME_MOUNTS: expected a JSON list"
+            ) from exc
+        if not isinstance(kanban_mounts, list) or any(
+            not isinstance(item, str) or ":" not in item
+            for item in kanban_mounts
+        ):
+            raise ValueError(
+                "Invalid HERMES_KANBAN_RUNTIME_MOUNTS: expected host:container strings"
+            )
+        internal_destinations = {
+            item.split(":", 1)[1].split(":", 1)[0]
+            for item in kanban_mounts
+        }
+        for existing in docker_volumes:
+            if not isinstance(existing, str) or ":" not in existing:
+                continue
+            destination = existing.split(":", 1)[1].split(":", 1)[0]
+            if (
+                destination in internal_destinations
+                and existing not in kanban_mounts
+            ):
+                raise ValueError(
+                    "Kanban Docker volume conflicts with required exact-path "
+                    f"mount destination {destination!r}"
+                )
+        docker_volumes = list(
+            dict.fromkeys([*docker_volumes, *kanban_mounts])
+        )
+        kanban_workspace = (
+            os.getenv("HERMES_KANBAN_WORKSPACE")
+            or os.getenv("TERMINAL_CWD")
+            or ""
+        ).strip()
+        if not os.path.isabs(kanban_workspace) or not os.path.isdir(
+            kanban_workspace
+        ):
+            raise ValueError(
+                "Kanban Docker startup requires an existing absolute "
+                "HERMES_KANBAN_WORKSPACE"
+            )
+        cwd = os.path.realpath(kanban_workspace)
+        host_cwd = None
+        mount_docker_cwd = False
+        container_persistent = False
+        docker_persist_across_processes = False
+        kanban_task_scoped = True
+    else:
+        kanban_task_scoped = False
+
     return {
         "env_type": env_type,
         "modal_mode": coerce_modal_mode(os.getenv("TERMINAL_MODAL_MODE", "auto")),
@@ -1447,7 +1526,7 @@ def _get_env_config() -> Dict[str, Any]:
         "container_cpu": container_cpu,
         "container_memory": container_memory,     # MB (default 5GB)
         "container_disk": container_disk,        # MB (default 50GB)
-        "container_persistent": os.getenv("TERMINAL_CONTAINER_PERSISTENT", "true").lower() in {"true", "1", "yes"},
+        "container_persistent": container_persistent,
         "docker_volumes": docker_volumes,
         "docker_env": docker_env,
         "docker_run_as_host_user": os.getenv("TERMINAL_DOCKER_RUN_AS_HOST_USER", "false").lower() in {"true", "1", "yes"},
@@ -1459,9 +1538,8 @@ def _get_env_config() -> Dict[str, Any]:
         # attaching to it instead of always starting a fresh one.  Set to
         # ``false`` for hard per-process isolation (no reuse, container is
         # removed on exit).
-        "docker_persist_across_processes": os.getenv(
-            "TERMINAL_DOCKER_PERSIST_ACROSS_PROCESSES", "true"
-        ).lower() in {"true", "1", "yes"},
+        "docker_persist_across_processes": docker_persist_across_processes,
+        "_kanban_task_scoped": kanban_task_scoped,
         # Startup orphan reaper for hermes-tagged containers left behind by
         # crashed / SIGKILL'd previous processes that bypassed atexit.
         # Conservative: only sweeps Exited containers older than 2× the
@@ -1538,6 +1616,7 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
             network=docker_network,
             extra_args=docker_extra_args,
             persist_across_processes=cc.get("docker_persist_across_processes", True),
+            task_scoped=bool(cc.get("_kanban_task_scoped", False)),
         )
     
     elif env_type == "singularity":
@@ -2305,6 +2384,9 @@ def terminal_tool(
                                 "docker_network": config.get("docker_network", True),
                                 "docker_persist_across_processes": config.get("docker_persist_across_processes", True),
                                 "docker_orphan_reaper": config.get("docker_orphan_reaper", True),
+                                "_kanban_task_scoped": config.get(
+                                    "_kanban_task_scoped", False,
+                                ),
                             }
 
                         local_config = None

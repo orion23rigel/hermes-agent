@@ -4,6 +4,8 @@ worktree path + branch instead of the random ``wt/<task-id>`` fallback."""
 from __future__ import annotations
 
 import os
+import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -20,14 +22,23 @@ def kanban_conn(tmp_path):
         c.close()
 
 
-def _make_project(name="Web App", repo="/tmp/webapp"):
+def _make_project(repo: Path, name="Web App"):
+    repo.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        ["git", "init", "-b", "main", str(repo)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
     with pdb.connect_closing() as pc:
-        pid = pdb.create_project(pc, name=name, folders=[repo])
+        pid = pdb.create_project(pc, name=name, folders=[str(repo)])
         return pdb.get_project(pc, pid)
 
 
-def test_project_linked_task_gets_deterministic_worktree_and_branch(kanban_conn):
-    proj = _make_project()
+def test_project_linked_task_gets_deterministic_worktree_and_branch(
+    kanban_conn, tmp_path
+):
+    proj = _make_project(tmp_path / "webapp")
     tid = kb.create_task(kanban_conn, title="Add login", project_id=proj.slug)
     task = kb.get_task(kanban_conn, tid)
 
@@ -40,8 +51,8 @@ def test_project_linked_task_gets_deterministic_worktree_and_branch(kanban_conn)
     assert not task.branch_name.startswith("wt/")
 
 
-def test_explicit_branch_overrides_project_default(kanban_conn):
-    proj = _make_project()
+def test_explicit_branch_overrides_project_default(kanban_conn, tmp_path):
+    proj = _make_project(tmp_path / "webapp")
     tid = kb.create_task(
         kanban_conn,
         title="x",

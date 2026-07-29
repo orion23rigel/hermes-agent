@@ -82,6 +82,8 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "session_id": t.session_id,
         "workflow_template_id": t.workflow_template_id,
         "current_step_key": t.current_step_key,
+        "superseded_by": t.superseded_by,
+        "superseded_at": t.superseded_at,
     }
 
 
@@ -699,6 +701,22 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         default=None,
         help="Permanently delete already-archived task ids from the board",
     )
+    p_supersede = sub.add_parser(
+        "supersede",
+        help="Atomically archive a failed task subtree in favor of a replacement",
+    )
+    p_supersede.add_argument("task_id", help="Root of the obsolete subtree")
+    p_supersede.add_argument(
+        "--with",
+        dest="replacement_task_id",
+        required=True,
+        help="Existing replacement task outside the obsolete subtree",
+    )
+    p_supersede.add_argument("--reason", default=None, help="Audit reason")
+    p_supersede.add_argument(
+        "--dry-run", action="store_true", help="Print affected tasks without mutation"
+    )
+    p_supersede.add_argument("--json", action="store_true")
 
     # --- tail ---
     p_tail = sub.add_parser("tail", help="Follow a task's event stream")
@@ -1069,6 +1087,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "unblock":  _cmd_unblock,
             "promote":  _cmd_promote,
             "archive":  _cmd_archive,
+            "supersede": _cmd_supersede,
             "tail":     _cmd_tail,
             "dispatch": _cmd_dispatch,
             "daemon":   _cmd_daemon,
@@ -1134,6 +1153,7 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "unblock",
     "promote",
     "archive",
+    "supersede",
     "dispatch",
     "daemon",
     "repair",
@@ -2414,6 +2434,44 @@ def _cmd_archive(args: argparse.Namespace) -> int:
             else:
                 print(f"Archived {tid}")
     return 0 if not failed else 1
+
+
+def _cmd_supersede(args: argparse.Namespace) -> int:
+    actor = _profile_author()
+    try:
+        with kb.connect_closing() as conn:
+            if args.dry_run:
+                affected = kb.supersede_subtree_preview(
+                    conn, args.task_id, args.replacement_task_id,
+                )
+            else:
+                affected = kb.supersede_subtree(
+                    conn,
+                    args.task_id,
+                    args.replacement_task_id,
+                    reason=args.reason,
+                    actor=actor,
+                )
+    except ValueError as exc:
+        print(f"kanban supersede: {exc}", file=sys.stderr)
+        return 1
+    payload = {
+        "root_task_id": args.task_id,
+        "replacement_task_id": args.replacement_task_id,
+        "affected_task_ids": affected,
+        "dry_run": bool(args.dry_run),
+    }
+    if args.json:
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+    else:
+        verb = "Would supersede" if args.dry_run else "Superseded"
+        print(
+            f"{verb} {len(affected)} task(s) rooted at {args.task_id} "
+            f"with replacement {args.replacement_task_id}"
+        )
+        for tid in affected:
+            print(f"  {tid}")
+    return 0
 
 
 def _cmd_tail(args: argparse.Namespace) -> int:

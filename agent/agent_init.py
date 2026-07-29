@@ -22,6 +22,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import subprocess
 import sys
 import threading
 import time
@@ -104,6 +105,160 @@ def _relay_moa_reference_event(agent: Any, event: str, **kwargs: Any) -> None:
             )
     except Exception:
         pass
+
+
+def _preflight_kanban_compression(agent: Any) -> None:
+    """Resolve the auxiliary compression route before a Kanban worker runs.
+
+    Ordinary conversations retain lazy probing for fast startup. A Kanban
+    worker is different: it is a bounded unattended process, and discovering
+    a deterministic sub-64K auxiliary route only after reading a large task
+    can consume every iteration then exit cleanly without terminal board
+    state. Fail during agent construction so the CLI can emit EX_CONFIG.
+    """
+    if not (os.getenv("HERMES_KANBAN_TASK") or "").strip():
+        return
+    from agent.conversation_compression import (
+        check_compression_model_feasibility,
+    )
+
+    check_compression_model_feasibility(agent)
+    agent._compression_feasibility_checked = True
+
+
+def _preflight_kanban_runtime(agent: Any) -> None:
+    """Validate task tools, workspace, and effective terminal configuration."""
+    task_id = (os.getenv("HERMES_KANBAN_TASK") or "").strip()
+    if not task_id:
+        return
+
+    required_tools = {"kanban_show", "kanban_complete", "kanban_block"}
+    available_tools = set(getattr(agent, "valid_tool_names", set()) or set())
+    missing_tools = sorted(required_tools - available_tools)
+    if missing_tools:
+        raise ValueError(
+            "Kanban worker profile is missing required lifecycle tools: "
+            + ", ".join(missing_tools)
+        )
+
+    workspace = (os.getenv("HERMES_KANBAN_WORKSPACE") or "").strip()
+    if not os.path.isabs(workspace) or not os.path.isdir(workspace):
+        raise ValueError(
+            "Kanban worker requires an existing absolute "
+            "HERMES_KANBAN_WORKSPACE"
+        )
+    if not os.access(workspace, os.R_OK | os.W_OK | os.X_OK):
+        raise ValueError(f"Kanban workspace is not writable: {workspace!r}")
+
+    run_raw = (os.getenv("HERMES_KANBAN_RUN_ID") or "").strip()
+    claim_lock = (os.getenv("HERMES_KANBAN_CLAIM_LOCK") or "").strip()
+    db_path = (os.getenv("HERMES_KANBAN_DB") or "").strip()
+    if not run_raw.isdigit() or not claim_lock or not os.path.isabs(db_path):
+        raise ValueError(
+            "Kanban worker requires pinned DB, run-id, and claim-lock metadata"
+        )
+    from hermes_cli import kanban_db as _kb
+
+    lease_conn = _kb.connect()
+    try:
+        lease_state = _kb.verify_worker_lease(
+            lease_conn,
+            task_id,
+            expected_run_id=int(run_raw),
+            expected_claim_lock=claim_lock,
+            expected_workspace=workspace,
+            expected_branch=(
+                (os.getenv("HERMES_KANBAN_BRANCH") or "").strip() or None
+            ),
+        )
+    finally:
+        lease_conn.close()
+    if lease_state != "active":
+        raise ValueError(
+            f"Kanban worker lease is {lease_state}; refusing stale execution"
+        )
+
+    from tools.terminal_tool import _get_env_config
+
+    terminal = _get_env_config()
+    backend = str(terminal.get("env_type") or "local")
+    is_git_workspace = os.path.exists(os.path.join(workspace, ".git"))
+    if backend == "docker":
+        if terminal.get("docker_persist_across_processes") is not False:
+            raise ValueError("Kanban Docker sandbox must be attempt-scoped")
+        mounts = set(terminal.get("docker_volumes") or [])
+        exact_mount = f"{os.path.realpath(workspace)}:{os.path.realpath(workspace)}"
+        if exact_mount not in mounts:
+            raise ValueError(
+                "Kanban Docker sandbox is missing the exact-path workspace mount"
+            )
+    elif backend != "local":
+        raise ValueError(
+            f"Kanban backend {backend!r} has no validated workspace/readback "
+            "contract; use local or Docker"
+        )
+
+    if is_git_workspace:
+        checked = subprocess.run(
+            ["git", "-C", workspace, "status", "--porcelain=v1"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=20,
+            check=False,
+        )
+        if checked.returncode != 0:
+            raise ValueError(
+                "Kanban worktree Git preflight failed: "
+                f"{checked.stderr.strip() or 'Git metadata unavailable'}"
+            )
+        expected_branch = (os.getenv("HERMES_KANBAN_BRANCH") or "").strip()
+        if not expected_branch:
+            raise ValueError(
+                "Kanban Git workspace requires a dispatcher-resolved branch"
+            )
+        if expected_branch:
+            branch = subprocess.run(
+                ["git", "-C", workspace, "branch", "--show-current"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=20,
+                check=False,
+            )
+            actual_branch = branch.stdout.strip()
+            if branch.returncode != 0 or actual_branch != expected_branch:
+                raise ValueError(
+                    "Kanban worktree branch preflight mismatch: expected "
+                    f"{expected_branch!r}, found {actual_branch or 'unknown'!r}"
+                )
+
+    if backend == "docker":
+        # Construct and smoke the exact attempt-scoped sandbox before the
+        # model can use host file tools or begin editing. DockerEnvironment's
+        # constructor performs PID, mount, Git-common-dir, branch, and index
+        # writability checks and removes itself on any failure.
+        import json as _json
+        from tools.terminal_tool import terminal_tool
+
+        smoke_raw = terminal_tool(
+            command="true",
+            timeout=20,
+            workdir=workspace,
+        )
+        try:
+            smoke = _json.loads(smoke_raw)
+        except (TypeError, ValueError, _json.JSONDecodeError) as exc:
+            raise ValueError(
+                "Kanban Docker startup smoke test returned invalid output"
+            ) from exc
+        if int(smoke.get("exit_code", -1)) != 0:
+            raise ValueError(
+                "Kanban Docker startup smoke test failed: "
+                f"{smoke.get('error') or smoke.get('output') or 'unknown error'}"
+            )
 
 
 def _normalize_route_base_url(base_url: Any) -> str:
@@ -2673,6 +2828,8 @@ def init_agent(
     # ``ensure_compression_feasibility_checked`` (called from
     # ``run_conversation``'s preflight) runs it at most once per agent.
     agent._compression_feasibility_checked = False
+    _preflight_kanban_compression(agent)
+    _preflight_kanban_runtime(agent)
 
     # Snapshot primary runtime for per-turn restoration.  When fallback
     # activates during a turn, the next turn restores these values so the

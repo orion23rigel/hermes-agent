@@ -17054,6 +17054,38 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 # Main Entry Point
 # ============================================================================
 
+def _kanban_worker_terminal_exit_code(default_code: int) -> int:
+    """Refuse rc=0 while the exact dispatched attempt still owns the card."""
+    if default_code != 0 or not os.environ.get("HERMES_KANBAN_TASK"):
+        return default_code
+    try:
+        from hermes_cli import kanban_db as _kb_exit
+
+        run_id = int(os.environ.get("HERMES_KANBAN_RUN_ID", ""))
+        claim = os.environ.get("HERMES_KANBAN_CLAIM_LOCK", "")
+        conn = _kb_exit.connect()
+        try:
+            lease = _kb_exit.verify_worker_lease(
+                conn,
+                os.environ["HERMES_KANBAN_TASK"],
+                expected_run_id=run_id,
+                expected_claim_lock=claim,
+                expected_workspace=os.environ.get("HERMES_KANBAN_WORKSPACE"),
+                expected_branch=(
+                    os.environ.get("HERMES_KANBAN_BRANCH") or None
+                ),
+            )
+        finally:
+            conn.close()
+        if lease == "active":
+            return _kb_exit.KANBAN_PROTOCOL_FAILURE_EXIT_CODE
+        return default_code
+    except Exception:
+        # Missing/corrupt worker lease metadata is a deterministic
+        # startup/contract failure, not a successful conversational exit.
+        return 78
+
+
 def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
     """Drive a kanban goal_mode worker through the Ralph-style goal loop.
 
@@ -17410,7 +17442,19 @@ def main(
                     # Cancel any pre-existing alarm to avoid colliding with
                     # caller-installed timers.
                     _sig_mod.signal(_sig_mod.SIGALRM, lambda *_: os._exit(0))
-                    _sig_mod.alarm(2)
+                    _sig_mod.alarm(20)
+            except Exception:
+                pass
+            try:
+                from tools.terminal_tool import (
+                    _resolve_container_task_id as _resolve_kb_container,
+                    cleanup_vm as _cleanup_kb_vm,
+                )
+
+                _cleanup_kb_vm(
+                    _resolve_kb_container(None),
+                    force_remove=True,
+                )
             except Exception:
                 pass
             try:
@@ -17629,9 +17673,25 @@ def main(
                                     _exit_code = _RL_CODE
                                 except Exception:
                                     _exit_code = 1
+                        _exit_code = _kanban_worker_terminal_exit_code(
+                            _exit_code
+                        )
                         sys.exit(_exit_code)
 
-                # Exit with error code if credentials or agent init fails
+                # Fail-closed Kanban startup preflight (credentials, profile
+                # route, compression model, sandbox config) is deterministic
+                # for the current deployment. EX_CONFIG lets the dispatcher
+                # block once instead of launching the same broken worker
+                # three times. Ordinary CLI automation keeps its historical
+                # generic rc=1 contract.
+                if os.environ.get("HERMES_KANBAN_TASK"):
+                    try:
+                        from hermes_cli.kanban_db import (
+                            KANBAN_PERMANENT_FAILURE_EXIT_CODE as _CONFIG_CODE,
+                        )
+                    except Exception:
+                        _CONFIG_CODE = 78
+                    sys.exit(_CONFIG_CODE)
                 sys.exit(1)
             else:
                 # Single-query mode (`hermes chat -q "…"`): skip the welcome

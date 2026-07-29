@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import subprocess
 import threading
 from pathlib import Path
 
@@ -92,7 +93,14 @@ def test_run_slash_create_and_list(kanban_home):
 
 
 def test_run_slash_create_worktree_path_and_branch(kanban_home, tmp_path):
-    target = tmp_path / ".worktrees" / "t6-wire"
+    repo = tmp_path / "repo"
+    subprocess.run(
+        ["git", "init", "-b", "main", str(repo)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    target = repo / ".worktrees" / "t6-wire"
     target_arg = target.as_posix()
     out = kc.run_slash(
         f"create 'ship worktree' --workspace worktree:{target_arg} --branch wt/t6-wire"

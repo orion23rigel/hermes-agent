@@ -222,6 +222,66 @@ def _generic_recovery_actions(task: Any, *, running: bool) -> list[DiagnosticAct
 RuleFn = Callable[[Any, list[Any], list[Any], int, dict], list[Diagnostic]]
 
 
+def _rule_invalid_workspace(task, events, runs, now, cfg) -> list[Diagnostic]:
+    """Report legacy rows that violate the creation-time workspace contract."""
+    status = str(_task_field(task, "status", "") or "")
+    if status in {"done", "archived"}:
+        return []
+    kind = str(_task_field(task, "workspace_kind", "scratch") or "scratch")
+    path = _task_field(task, "workspace_path", None)
+    try:
+        from hermes_cli.kanban_db import (
+            WorkspaceValidationError,
+            validate_workspace_spec,
+        )
+
+        validate_workspace_spec(kind, path)
+    except WorkspaceValidationError as exc:
+        task_id = str(_task_field(task, "id", "") or "")
+        created_at = int(_task_field(task, "created_at", now) or now)
+        return [
+            Diagnostic(
+                kind="invalid_workspace",
+                severity="critical",
+                title="Task workspace cannot start",
+                detail=(
+                    f"{exc}. This is deterministic and will not be retried. "
+                    "Create a corrected replacement task, then atomically "
+                    "supersede this task's stale dependency subtree."
+                ),
+                actions=[
+                    DiagnosticAction(
+                        kind="cli_hint",
+                        label="Preview atomic supersession",
+                        payload={
+                            "command": (
+                                f"hermes kanban supersede {task_id} "
+                                "--with <replacement-task-id> --dry-run"
+                            )
+                        },
+                        suggested=True,
+                    ),
+                    DiagnosticAction(
+                        kind="cli_hint",
+                        label="Inspect board defaults",
+                        payload={"command": "hermes kanban boards list --json"},
+                    ),
+                ],
+                first_seen_at=created_at,
+                last_seen_at=now,
+                data={
+                    "workspace_kind": kind,
+                    "workspace_path": path,
+                    "retryable": False,
+                },
+            )
+        ]
+    except Exception:
+        # Runtime/tooling unavailable is not evidence that the row is invalid.
+        return []
+    return []
+
+
 def _aux_slot_explicit(slot: Any) -> bool:
     """Return True if the auxiliary slot has user-supplied non-default fields.
 
@@ -1003,6 +1063,7 @@ def _rule_stranded_in_ready(task, events, runs, now, cfg) -> list[Diagnostic]:
 # Registry — order matters: rules higher on the list render first when
 # severity ties. Add new rules here.
 _RULES: list[RuleFn] = [
+    _rule_invalid_workspace,
     _rule_hallucinated_cards,
     _rule_triage_aux_unavailable,
     _rule_prose_phantom_refs,
@@ -1017,6 +1078,7 @@ _RULES: list[RuleFn] = [
 # Known kinds (for the UI's filter / legend / i18n keys). Update when
 # rules are added.
 DIAGNOSTIC_KINDS = (
+    "invalid_workspace",
     "hallucinated_cards",
     "triage_aux_unavailable",
     "prose_phantom_refs",

@@ -242,7 +242,9 @@ def test_workspace_kind_validation(kanban_home):
 
 
 def test_create_task_persists_worktree_branch_name(kanban_home, tmp_path):
-    target = tmp_path / ".worktrees" / "t6-wire"
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    target = repo / ".worktrees" / "t6-wire"
     with kb.connect() as conn:
         tid = kb.create_task(
             conn,
@@ -2198,11 +2200,9 @@ def test_worktree_no_path_no_board_default_raises(kanban_home, tmp_path, monkeyp
     _init_git_repo(decoy_repo)
     monkeypatch.chdir(decoy_repo)
     with kb.connect() as conn:
-        t = kb.create_task(conn, title="ship", workspace_kind="worktree")
-        task = kb.get_task(conn, t)
-        assert task is not None
         with pytest.raises(ValueError, match="default_workdir"):
-            kb.resolve_workspace(task)
+            kb.create_task(conn, title="ship", workspace_kind="worktree")
+        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
 
 
 def test_worktree_workspace_explicit_target_materializes_linked_worktree(kanban_home, tmp_path):

@@ -839,6 +839,7 @@ class DockerEnvironment(BaseEnvironment):
         run_as_host_user: bool = False,
         extra_args: list = None,
         persist_across_processes: bool = True,
+        task_scoped: bool = False,
     ):
         if cwd == "~":
             cwd = "/root"
@@ -846,6 +847,10 @@ class DockerEnvironment(BaseEnvironment):
         self._persistent = persistent_filesystem
         self._persist_across_processes = persist_across_processes
         self._task_id = task_id
+        # This enables destructive predecessor quarantine and synchronous
+        # teardown, so it must come from the dispatcher's internal contract,
+        # never from a caller-controlled task-id prefix.
+        self._kanban_task_scoped = bool(task_scoped)
         self._forward_env = _normalize_forward_env_names(forward_env)
         self._env = _normalize_env_dict(env)
         self._container_id: Optional[str] = None
@@ -1330,6 +1335,13 @@ class DockerEnvironment(BaseEnvironment):
             _EGRESS_LABEL_KEY: egress_label,
         }
 
+        # A prior attempt can bypass Python cleanup via SIGKILL/os._exit.
+        # Before a retry, quarantine only containers carrying this exact
+        # Kanban task+profile label pair. Never sweep ordinary chat or another
+        # card's sandbox.
+        if self._kanban_task_scoped:
+            self._remove_task_scoped_predecessors(task_label, profile_name)
+
         # Cross-process container reuse (issue #20561 — docs claim "ONE long-lived
         # container shared across sessions").  If a prior Hermes process
         # already started a container for this (task_id, profile) and it
@@ -1462,9 +1474,248 @@ class DockerEnvironment(BaseEnvironment):
         # to inject host env vars into the snapshot; subsequent commands get
         # them from the snapshot file).
         self._init_env_args = self._build_init_env_args()
+        if self._kanban_task_scoped:
+            self._validate_task_scoped_container(cwd)
 
-        # Initialize session snapshot inside the container
-        self.init_session()
+        # Initialize session snapshot inside the container. Treat failures
+        # here exactly like mount/PID/Git preflight failures: the sandbox has
+        # already been created and must not leak.
+        try:
+            self.init_session()
+        except Exception:
+            if self._kanban_task_scoped:
+                self.cleanup(force_remove=True)
+            raise
+
+    def _remove_task_scoped_predecessors(
+        self, task_label: str, profile_label: str
+    ) -> None:
+        """Remove only stale containers for this exact Kanban card/profile."""
+        try:
+            found = subprocess.run(
+                [
+                    self._docker_exe,
+                    "ps",
+                    "-aq",
+                    "--filter",
+                    "label=hermes-agent=1",
+                    "--filter",
+                    f"label=hermes-task-id={task_label}",
+                    "--filter",
+                    f"label=hermes-profile={profile_label}",
+                ],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=15,
+                check=False,
+                stdin=subprocess.DEVNULL,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise RuntimeError(
+                f"Kanban sandbox quarantine probe failed: {exc}"
+            ) from exc
+        if found.returncode != 0:
+            raise RuntimeError(
+                "Kanban sandbox quarantine probe failed: "
+                f"{found.stderr.strip() or 'docker ps error'}"
+            )
+        for container_id in found.stdout.split():
+            removed = subprocess.run(
+                [self._docker_exe, "rm", "-f", container_id],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=30,
+                check=False,
+                stdin=subprocess.DEVNULL,
+            )
+            if removed.returncode != 0:
+                raise RuntimeError(
+                    f"could not quarantine stale Kanban sandbox "
+                    f"{container_id[:12]}: "
+                    f"{removed.stderr.strip() or 'docker rm error'}"
+                )
+
+    def _validate_task_scoped_container(self, workspace: str) -> None:
+        """Fail closed on polluted capacity, missing mounts, or broken Git."""
+        try:
+            self._validate_task_scoped_container_unchecked(workspace)
+        except Exception:
+            # Any timeout/OSError/parse failure after ``docker run`` must not
+            # strand the new attempt. Cleanup is synchronous for task-scoped
+            # environments and targets only this exact container id.
+            self.cleanup(force_remove=True)
+            raise
+
+    def _validate_task_scoped_container_unchecked(self, workspace: str) -> None:
+        """Run task-scoped validation; caller owns fail-closed cleanup."""
+        container_id = self._container_id
+        if not container_id:
+            raise RuntimeError("Kanban Docker sandbox did not start")
+
+        capacity = subprocess.run(
+            [
+                self._docker_exe,
+                "exec",
+                container_id,
+                "sh",
+                "-c",
+                "cur=$(cat /sys/fs/cgroup/pids.current 2>/dev/null || "
+                "cat /sys/fs/cgroup/pids/pids.current 2>/dev/null || true); "
+                "max=$(cat /sys/fs/cgroup/pids.max 2>/dev/null || "
+                "cat /sys/fs/cgroup/pids/pids.max 2>/dev/null || true); "
+                "printf '%s %s\\n' \"${cur:-unknown}\" \"${max:-unknown}\"",
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=15,
+            check=False,
+            stdin=subprocess.DEVNULL,
+        )
+        if capacity.returncode != 0:
+            raise RuntimeError(
+                "Kanban Docker PID-capacity preflight failed: "
+                f"{capacity.stderr.strip() or 'docker exec error'}"
+            )
+        parts = capacity.stdout.strip().split()
+        if len(parts) < 2 or not parts[0].isdigit() or not parts[1].isdigit():
+            raise RuntimeError(
+                "Kanban Docker PID-capacity preflight could not read a finite "
+                "cgroup PID limit"
+            )
+        current, maximum = int(parts[0]), int(parts[1])
+        if maximum <= 0:
+            raise RuntimeError(
+                "Kanban Docker PID-capacity preflight found no finite PID limit"
+            )
+        if maximum - current < 16 or current / maximum >= 0.90:
+            raise RuntimeError(
+                f"Kanban Docker sandbox has insufficient PID capacity "
+                f"({current}/{maximum}); sandbox removed for a clean retry"
+            )
+
+        workspace_check = subprocess.run(
+            [
+                self._docker_exe,
+                "exec",
+                container_id,
+                "test",
+                "-d",
+                workspace,
+            ],
+            capture_output=True,
+            timeout=15,
+            check=False,
+            stdin=subprocess.DEVNULL,
+        )
+        if workspace_check.returncode != 0:
+            raise RuntimeError(
+                f"Kanban workspace mount is not visible at {workspace!r}"
+            )
+
+        # Worktree Git metadata is host-visible at startup. Verify the same
+        # checkout works through the actual container before the model can edit
+        # files. A missing git executable is also a hard worker defect.
+        if os.path.exists(os.path.join(workspace, ".git")):
+            git_check = subprocess.run(
+                [
+                    self._docker_exe,
+                    "exec",
+                    container_id,
+                    "git",
+                    "-C",
+                    workspace,
+                    "rev-parse",
+                    "--path-format=absolute",
+                    "--git-common-dir",
+                ],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=20,
+                check=False,
+                stdin=subprocess.DEVNULL,
+            )
+            if git_check.returncode != 0:
+                raise RuntimeError(
+                    "Kanban worktree is not commit-capable inside Docker: "
+                    f"{git_check.stderr.strip() or 'Git metadata unavailable'}"
+                )
+            host_common = subprocess.run(
+                [
+                    "git", "-C", workspace, "rev-parse",
+                    "--path-format=absolute", "--git-common-dir",
+                ],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=20,
+                check=False,
+            )
+            if (
+                host_common.returncode != 0
+                or os.path.realpath(git_check.stdout.strip())
+                != os.path.realpath(host_common.stdout.strip())
+            ):
+                raise RuntimeError(
+                    "Kanban Docker Git common-dir does not match the host "
+                    "worktree metadata"
+                )
+            branch_check = subprocess.run(
+                [
+                    self._docker_exe, "exec", container_id, "git", "-C",
+                    workspace, "branch", "--show-current",
+                ],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=20,
+                check=False,
+                stdin=subprocess.DEVNULL,
+            )
+            host_branch = subprocess.run(
+                ["git", "-C", workspace, "branch", "--show-current"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=20,
+                check=False,
+            )
+            if (
+                branch_check.returncode != 0
+                or host_branch.returncode != 0
+                or branch_check.stdout.strip() != host_branch.stdout.strip()
+            ):
+                raise RuntimeError(
+                    "Kanban Docker Git branch does not match the host worktree"
+                )
+            write_check = subprocess.run(
+                [
+                    self._docker_exe, "exec", container_id, "git", "-C",
+                    workspace, "update-index", "--refresh", "-q",
+                ],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=20,
+                check=False,
+                stdin=subprocess.DEVNULL,
+            )
+            if write_check.returncode != 0:
+                raise RuntimeError(
+                    "Kanban worktree Git index is not writable inside Docker: "
+                    f"{write_check.stderr.strip() or 'update-index failed'}"
+                )
 
     def _build_init_env_args(self) -> list[str]:
         """Build -e KEY=VALUE args for injecting host env vars into init_session.
@@ -1890,6 +2141,23 @@ class DockerEnvironment(BaseEnvironment):
         log_id = container_id[:12]
 
         def _do_cleanup() -> None:
+            if self._kanban_task_scoped and force_remove:
+                # Signal/supersede teardown must be bounded and exact. A
+                # graceful ten-second stop can outlive the worker's shutdown
+                # watchdog; rm -f sends SIGKILL and removes only this recorded
+                # container id.
+                try:
+                    subprocess.run(
+                        [docker_exe, "rm", "-f", container_id],
+                        capture_output=True,
+                        timeout=15,
+                        stdin=subprocess.DEVNULL,
+                    )
+                except (subprocess.TimeoutExpired, OSError) as e:
+                    logger.warning(
+                        "docker rm -f %s timed out / failed: %s", log_id, e,
+                    )
+                return
             if should_stop:
                 try:
                     subprocess.run(
@@ -1908,6 +2176,19 @@ class DockerEnvironment(BaseEnvironment):
                     )
                 except (subprocess.TimeoutExpired, OSError) as e:
                     logger.warning("docker rm -f %s failed: %s", log_id, e)
+
+        if self._kanban_task_scoped:
+            # Task attempts are bounded jobs, not long-lived chat sandboxes.
+            # Complete stop/rm before returning so CLI registry teardown cannot
+            # lose the cleanup thread and leak its process tree.
+            _do_cleanup()
+            self._cleanup_thread = None
+            self._container_id = None
+            if should_remove and not self._persistent:
+                for d in (self._workspace_dir, self._home_dir):
+                    if d:
+                        shutil.rmtree(d, ignore_errors=True)
+            return
 
         # Daemon thread: doesn't block interpreter exit (atexit returns
         # promptly), but unlike the old ``Popen(... &)`` shell trick the

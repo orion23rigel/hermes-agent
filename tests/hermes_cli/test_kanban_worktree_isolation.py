@@ -7,8 +7,9 @@ on whatever branch was there, letting sibling workers run concurrently in
 one directory on one branch (cross-task provenance corruption, no lock).
 
 Two-part fix under test:
-- ``decompose_triage_task`` leaves worktree children's ``workspace_path``
-  unset so each child materializes its own ``<repo>/.worktrees/<child-id>``.
+- ``decompose_triage_task`` stores the owning repository anchor (never the
+  root's checkout), so each child materializes its own
+  ``<repo>/.worktrees/<child-id>`` without depending on a board default.
 - ``_resolve_worktree_workspace`` falls back to a fresh per-task worktree
   when the requested path is occupied by another task's branch (heals
   pre-existing rows that still carry a shared path).
@@ -66,13 +67,14 @@ def _add_worktree(repo: Path, target: Path, branch: str) -> Path:
     return target
 
 
-def test_decompose_worktree_children_get_own_workspace(kanban_home):
+def test_decompose_worktree_children_get_own_workspace(kanban_home, tmp_path):
+    repo = _make_repo(tmp_path)
     with kb.connect() as conn:
         root = kb.create_task(conn, title="build the feature", triage=True)
         conn.execute(
             "UPDATE tasks SET workspace_kind='worktree', "
-            "workspace_path='/repo/.worktrees/root' WHERE id = ?",
-            (root,),
+            "workspace_path=? WHERE id = ?",
+            (str(repo), root),
         )
         conn.commit()
 
@@ -95,8 +97,8 @@ def test_decompose_worktree_children_get_own_workspace(kanban_home):
             ).fetchone()
             assert row["workspace_kind"] == "worktree"
             # Each child resolves its own <repo>/.worktrees/<child-id> at
-            # dispatch; the root's literal path must never be shared.
-            assert row["workspace_path"] is None
+            # dispatch; the root's literal checkout must never be shared.
+            assert row["workspace_path"] == str(repo)
 
 
 def test_decompose_dir_children_still_inherit_path(kanban_home):
@@ -158,6 +160,7 @@ def test_resolve_worktree_same_branch_still_reuses(kanban_home, tmp_path):
             conn,
             title="returning task",
             workspace_kind="worktree",
+            workspace_path=str(repo),
         )
         own = _add_worktree(repo, repo / ".worktrees" / tid, f"wt/{tid}")
         conn.execute(
@@ -182,6 +185,7 @@ def test_resolve_worktree_own_path_on_foreign_branch_keeps_legacy_reuse(
             conn,
             title="foreign-branch checkout",
             workspace_kind="worktree",
+            workspace_path=str(repo),
         )
         own = _add_worktree(repo, repo / ".worktrees" / tid, "wt/foreign")
         conn.execute(
