@@ -1781,6 +1781,12 @@ def test_kanban_guidance_in_worker_prompt(monkeypatch, tmp_path):
 
     from tools.registry import invalidate_check_fn_cache
     from model_tools import _clear_tool_defs_cache
+    # This test isolates prompt injection. Strict unattended-worker
+    # compression preflight is covered by dedicated reliability tests.
+    monkeypatch.setattr(
+        "agent.conversation_compression.check_compression_model_feasibility",
+        lambda _agent, *, strict=False: None,
+    )
     invalidate_check_fn_cache()
     _clear_tool_defs_cache()
 

@@ -8,24 +8,47 @@ model / API quota / browser pool from being overwhelmed by a fan-out.
 from __future__ import annotations
 
 import os
+import shutil
 import sys
 import tempfile
 
 import pytest
 
 
+def _kanban_module_names():
+    return [
+        mod
+        for mod in sys.modules
+        if mod.startswith("hermes_cli") or mod.startswith("hermes_state") or mod == "hermes_constants"
+    ]
+
+
 @pytest.fixture()
 def isolated_kanban_home_with_profiles(monkeypatch):
-    """Spin up a fresh HERMES_HOME with kanban DB + alpha/beta profiles."""
+    """Spin up a fresh HERMES_HOME with kanban DB + alpha/beta profiles.
+
+    Deleting hermes_cli/hermes_state/hermes_constants from sys.modules forces
+    a reimport under the temp HERMES_HOME, but that reimport must not leak
+    into other test files: we save the original module objects and restore
+    them afterward, and drop whatever got (re)imported during the test so a
+    stale module object never outlives this fixture.
+    """
     test_home = tempfile.mkdtemp(prefix="kanban_per_profile_cap_test_")
     for prof in ("alpha", "beta", "default"):
         os.makedirs(os.path.join(test_home, "profiles", prof), exist_ok=True)
     monkeypatch.setenv("HERMES_HOME", test_home)
-    for mod in list(sys.modules.keys()):
-        if mod.startswith("hermes_cli") or mod.startswith("hermes_state") or mod == "hermes_constants":
-            del sys.modules[mod]
-    from hermes_cli import kanban_db
-    yield kanban_db
+
+    saved_modules = {name: sys.modules[name] for name in _kanban_module_names()}
+    for name in saved_modules:
+        del sys.modules[name]
+    try:
+        from hermes_cli import kanban_db
+        yield kanban_db
+    finally:
+        for name in _kanban_module_names():
+            del sys.modules[name]
+        sys.modules.update(saved_modules)
+        shutil.rmtree(test_home, ignore_errors=True)
 
 
 def _fake_spawn(*args, **kwargs):

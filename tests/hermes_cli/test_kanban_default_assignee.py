@@ -8,26 +8,45 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sys
 import tempfile
 
 import pytest
 
 
+def _kanban_module_names():
+    return [
+        mod
+        for mod in sys.modules
+        if mod.startswith("hermes_cli") or mod.startswith("hermes_state") or mod == "hermes_constants"
+    ]
+
+
 @pytest.fixture()
 def isolated_kanban_home(monkeypatch):
-    """Spin up a fresh HERMES_HOME with a clean kanban DB."""
+    """Spin up a fresh HERMES_HOME with a clean kanban DB.
+
+    Deleting hermes_cli/hermes_state/hermes_constants from sys.modules forces
+    a reimport under the temp HERMES_HOME, but that reimport must not leak
+    into other test files: we save the original module objects and restore
+    them afterward, and drop whatever got (re)imported during the test so a
+    stale module object never outlives this fixture.
+    """
     test_home = tempfile.mkdtemp(prefix="kanban_default_assignee_test_")
     monkeypatch.setenv("HERMES_HOME", test_home)
-    # Force-reimport so the fresh HERMES_HOME is picked up.
-    for mod in list(sys.modules.keys()):
-        if mod.startswith("hermes_cli") or mod.startswith("hermes_state") or mod == "hermes_constants":
-            del sys.modules[mod]
-    from hermes_cli import kanban_db
-    yield kanban_db, test_home
-    # Cleanup is best-effort; tempfile dir survives but pytest isolation
-    # gives each test its own monkeypatched HERMES_HOME so no cross-test
-    # contamination.
+
+    saved_modules = {name: sys.modules[name] for name in _kanban_module_names()}
+    for name in saved_modules:
+        del sys.modules[name]
+    try:
+        from hermes_cli import kanban_db
+        yield kanban_db, test_home
+    finally:
+        for name in _kanban_module_names():
+            del sys.modules[name]
+        sys.modules.update(saved_modules)
+        shutil.rmtree(test_home, ignore_errors=True)
 
 
 def _fake_spawn(*args, **kwargs):

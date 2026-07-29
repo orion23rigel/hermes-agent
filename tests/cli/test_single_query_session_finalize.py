@@ -175,7 +175,9 @@ def test_human_single_query_main_finalizes_after_query(monkeypatch):
 
         def chat(self, query, images=None):
             calls.append(("chat", query, images))
-            return "done"
+            # The interactive chat API is side-effecting and may return None on
+            # success; the initialized agent, not a response sentinel, proves it ran.
+            return None
 
         def _print_exit_summary(self, clear_screen=True):
             calls.append("summary")
@@ -268,3 +270,96 @@ def test_quiet_single_query_main_finalizes_while_preserving_exit_code(monkeypatc
     assert ("claim", "cli", True) in calls
     assert ("run", "hello", []) in calls
     assert calls[-1] == ("finalize", "quiet-session")
+
+
+@pytest.mark.parametrize("init_exit_code", [1, 78])
+def test_quiet_worker_init_failure_honors_classified_exit_marker(
+    tmp_path, monkeypatch, init_exit_code
+):
+    import cli as cli_mod
+
+    class FakeCLI:
+        def __init__(self, **_kwargs):
+            self.provider = "test-provider"
+            self.model = "test-model"
+            self.session_id = "quiet-init-failure"
+            self.conversation_history = []
+            self._active_agent_route_signature = "same-route"
+            self.agent = None
+            self._agent_init_exit_code = init_exit_code
+
+        def _claim_active_session(self, _surface, *, stderr=False):
+            return True
+
+        def _ensure_runtime_credentials(self):
+            return True
+
+        def _resolve_turn_agent_config(self, _effective_query):
+            return {
+                "signature": "same-route",
+                "model": None,
+                "runtime": None,
+                "request_overrides": None,
+            }
+
+        def _init_agent(self, **_kwargs):
+            return False
+
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_quiet_init")
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "kanban.db"))
+    monkeypatch.delenv("HERMES_KANBAN_GOAL_MODE", raising=False)
+    monkeypatch.setattr(cli_mod, "HermesCLI", FakeCLI)
+    monkeypatch.setattr(cli_mod.atexit, "register", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(cli_mod, "_finalize_single_query", lambda _cli: None)
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli_mod.main(query="hello", quiet=True, toolsets="terminal")
+
+    assert exc_info.value.code == init_exit_code
+
+
+@pytest.mark.parametrize("init_exit_code", [1, 78])
+def test_human_worker_init_failure_honors_classified_exit_marker(
+    tmp_path, monkeypatch, init_exit_code
+):
+    import cli as cli_mod
+
+    class _Console:
+        def print(self, *_args, **_kwargs):
+            pass
+
+    class FakeCLI:
+        def __init__(self, **_kwargs):
+            self.console = _Console()
+            self.session_id = "human-init-failure"
+            self.agent = None
+            self._agent_init_exit_code = init_exit_code
+
+        def _claim_active_session(self, _surface, *, stderr=False):
+            return True
+
+        def _show_security_advisories(self):
+            pass
+
+        def chat(self, _query, images=None):
+            return None
+
+        def _print_exit_summary(self, clear_screen=True):
+            pass
+
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_human_init")
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "kanban.db"))
+    monkeypatch.setattr(cli_mod, "HermesCLI", FakeCLI)
+    monkeypatch.setattr(cli_mod.atexit, "register", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(cli_mod, "_finalize_single_query", lambda _cli: None)
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli_mod.main(query="hello", quiet=False, toolsets="terminal")
+
+    assert exc_info.value.code == init_exit_code

@@ -2046,8 +2046,7 @@ def _cmd_claim(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 1
-        workspace = kb.resolve_workspace(task)
-        kb.set_workspace_path(conn, task.id, str(workspace))
+        workspace = kb._prepare_claimed_workspace(conn, task)
     print(f"Claimed {task.id}")
     print(f"Workspace: {workspace}")
     return 0

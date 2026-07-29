@@ -6490,12 +6490,26 @@ def supersede_subtree_preview(
     """Return the deterministic affected-id set without mutating the board."""
     root = conn.execute("SELECT id FROM tasks WHERE id = ?", (root_id,)).fetchone()
     replacement = conn.execute(
-        "SELECT id FROM tasks WHERE id = ?", (replacement_task_id,)
+        "SELECT id, status, superseded_by FROM tasks WHERE id = ?",
+        (replacement_task_id,),
     ).fetchone()
     if root is None:
         raise ValueError(f"unknown superseded root task: {root_id}")
     if replacement is None:
         raise ValueError(f"unknown replacement task: {replacement_task_id}")
+    if replacement["status"] == "archived":
+        detail = (
+            " and already superseded"
+            if replacement["superseded_by"]
+            else ""
+        )
+        raise ValueError(
+            f"replacement task {replacement_task_id} is archived{detail}"
+        )
+    if replacement["superseded_by"]:
+        raise ValueError(
+            f"replacement task {replacement_task_id} is already superseded"
+        )
     rows = conn.execute(
         """
         WITH RECURSIVE subtree(id) AS (
@@ -6599,6 +6613,10 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
             (task_id,),
         ).fetchone()
         if not row or row["status"] != "archived":
+            return False
+        if conn.execute(
+            "SELECT 1 FROM tasks WHERE superseded_by = ? LIMIT 1", (task_id,)
+        ).fetchone():
             return False
         conn.execute(
             "DELETE FROM task_links WHERE parent_id = ? OR child_id = ?",
@@ -6930,20 +6948,21 @@ def _single_parent_result_sha(
     ).fetchall()
     if not parents:
         return None
-    if any(parent["status"] != "done" for parent in parents):
-        raise WorkspaceValidationError(
-            f"task {task.id} has a parent that is not completed"
-        )
     worktree_parents = [
         parent for parent in parents if parent["workspace_kind"] == "worktree"
     ]
-    if len(parents) != 1:
-        if worktree_parents:
-            raise WorkspaceValidationError(
-                f"task {task.id} has multiple worktree-producing parents; "
-                "route them through an explicit integration task before dispatch"
-            )
+    if not worktree_parents:
         return None
+    if len(worktree_parents) != 1:
+        raise WorkspaceValidationError(
+            f"task {task.id} has multiple worktree-producing parents; "
+            "route them through an explicit integration task before dispatch"
+        )
+    parent = worktree_parents[0]
+    if parent["status"] != "done":
+        raise WorkspaceValidationError(
+            f"worktree-producing parent {parent['id']} is not completed"
+        )
     run = conn.execute(
         """
         SELECT metadata
@@ -6952,13 +6971,13 @@ def _single_parent_result_sha(
          ORDER BY ended_at DESC, id DESC
          LIMIT 1
         """,
-        (parents[0]["id"],),
+        (parent["id"],),
     ).fetchone()
-    parent_requires_provenance = parents[0]["workspace_kind"] == "worktree"
+    parent_requires_provenance = True
     if run is None or not run["metadata"]:
         if parent_requires_provenance:
             raise WorkspaceValidationError(
-                f"completed worktree parent {parents[0]['id']} has no trusted "
+                f"completed worktree parent {parent['id']} has no trusted "
                 "result provenance"
             )
         return None
@@ -6967,7 +6986,7 @@ def _single_parent_result_sha(
     except (TypeError, ValueError, json.JSONDecodeError):
         if parent_requires_provenance:
             raise WorkspaceValidationError(
-                f"completed worktree parent {parents[0]['id']} has invalid "
+                f"completed worktree parent {parent['id']} has invalid "
                 "result provenance"
             )
         return None
@@ -6984,7 +7003,7 @@ def _single_parent_result_sha(
     if not result_sha:
         if parent_requires_provenance:
             raise WorkspaceValidationError(
-                f"completed worktree parent {parents[0]['id']} has no result SHA"
+                f"completed worktree parent {parent['id']} has no result SHA"
             )
         return None
     parent_common = (
@@ -7003,7 +7022,7 @@ def _single_parent_result_sha(
         )
     ):
         raise WorkspaceValidationError(
-            f"completed worktree parent {parents[0]['id']} belongs to a "
+            f"completed worktree parent {parent['id']} belongs to a "
             "different Git common directory"
         )
     reachable = subprocess.run(
@@ -7101,6 +7120,38 @@ def _record_worktree_run_start(
             run_id=task.current_run_id,
         )
     return start
+
+
+def _prepare_claimed_workspace(
+    conn: sqlite3.Connection,
+    task: Task,
+    *,
+    board: Optional[str] = None,
+) -> Path:
+    """Resolve, persist, and server-stamp one claimed task's workspace."""
+    if task.workspace_kind == "worktree":
+        workspace, resolved_branch = _resolve_worktree_workspace(
+            task, board=board, conn=conn,
+        )
+        final_branch = (
+            resolved_branch
+            or (task.branch_name or "").strip()
+            or f"wt/{task.id}"
+        )
+        set_workspace_path(conn, task.id, str(workspace))
+        set_branch_name(conn, task.id, final_branch)
+        _record_worktree_run_start(
+            conn, task.id, Path(workspace), final_branch,
+        )
+        # The worker spawn consumes this already-loaded Task object, so keep it
+        # consistent with the durable row rather than passing stale None values.
+        task.workspace_path = str(workspace)
+        task.branch_name = final_branch
+        return Path(workspace)
+    workspace = resolve_workspace(task, board=board)
+    set_workspace_path(conn, task.id, str(workspace))
+    task.workspace_path = str(workspace)
+    return Path(workspace)
 
 
 def _resolve_worktree_workspace(
@@ -7524,7 +7575,7 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
     * ``"clean_exit"`` — ``WIFEXITED`` with ``WEXITSTATUS == 0``. When the
       task is still ``running`` in the DB, this is a protocol violation
       (worker exited without calling ``kanban_complete`` / ``kanban_block``)
-      and should be auto-blocked immediately — retrying will just loop.
+      and consumes the bounded protocol-violation streak.
     * ``"rate_limited"`` — ``WIFEXITED`` with status
       ``KANBAN_RATE_LIMIT_EXIT_CODE``. The worker bailed because the
       provider rate-limited / exhausted quota, NOT because the task failed.
@@ -7532,8 +7583,8 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
       counting a failure, so a long quota window can't trip the breaker.
     * ``"permanent_failure"`` — ``WIFEXITED`` with status
       ``KANBAN_PERMANENT_FAILURE_EXIT_CODE``. Startup preflight found a
-      deterministic profile/model/sandbox defect; retrying unchanged state
-      cannot help and the task is blocked on this first observation.
+      proven structural worker-contract defect; retrying unchanged state cannot
+      help and the task is blocked on this first observation.
     * ``"nonzero_exit"`` — ``WIFEXITED`` with non-zero status. Real error.
     * ``"signaled"`` — ``WIFSIGNALED`` (OOM killer, SIGKILL, etc). Real crash.
     * ``"unknown"`` — pid was not in the reap registry (either reaped by
@@ -8168,12 +8219,10 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     ``_default_spawn`` always runs the worker on the same host as the
     dispatcher (the whole design is single-host).
 
-    When the reap registry shows the worker exited cleanly (rc=0) but
-    the task was still ``running`` in the DB, treat it as a protocol
-    violation (worker answered conversationally without calling
-    ``kanban_complete`` / ``kanban_block``) and trip the circuit breaker
-    on the first occurrence — retrying a worker whose CLI keeps
-    returning 0 without a terminal transition just loops forever.
+    When the reap registry shows the worker exited cleanly (rc=0) but the task
+    was still ``running`` in the DB, treat it as a protocol violation (worker
+    answered conversationally without calling ``kanban_complete`` /
+    ``kanban_block``) and account it against the bounded violation-only streak.
 
     When the reap registry shows the worker exited with the rate-limit
     sentinel (``KANBAN_RATE_LIMIT_EXIT_CODE``), the worker bailed on a
@@ -8242,7 +8291,6 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 event_payload = {
                     "pid": pid,
                     "claimer": row["claim_lock"],
-                    "exit_code": code,
                     # Durable marker for _protocol_violation_streak: _end_run
                     # copies this payload into the run metadata, which is how
                     # the violation-only retry budget is derived later.
@@ -9292,25 +9340,9 @@ def _dispatch_once_locked(
         if claimed is None:
             continue
         try:
-            resolved_branch_name = None
-            if claimed.workspace_kind == "worktree":
-                workspace, resolved_branch_name = _resolve_worktree_workspace(
-                    claimed, board=board, conn=conn,
-                )
-            else:
-                workspace = resolve_workspace(claimed, board=board)
-            # Persist the resolved workspace path so the worker can cd there.
-            set_workspace_path(conn, claimed.id, str(workspace))
-            if claimed.workspace_kind == "worktree":
-                final_branch = (
-                    resolved_branch_name
-                    or (claimed.branch_name or "").strip()
-                    or f"wt/{claimed.id}"
-                )
-                set_branch_name(conn, claimed.id, final_branch)
-                _record_worktree_run_start(
-                    conn, claimed.id, Path(workspace), final_branch,
-                )
+            workspace = _prepare_claimed_workspace(
+                conn, claimed, board=board,
+            )
         except Exception as exc:
             if isinstance(
                 exc, (WorkspaceValidationError, WorktreeProvenanceError)
@@ -9415,27 +9447,10 @@ def _dispatch_once_locked(
         if claimed is None:
             continue
         try:
-            resolved_branch_name = None
-            if claimed.workspace_kind == "worktree":
-                workspace, resolved_branch_name = _resolve_worktree_workspace(
-                    claimed, board=board, conn=conn,
-                )
-            else:
-                workspace = resolve_workspace(claimed, board=board)
-            # Persist and stamp inside the same typed preflight boundary as
-            # resolution. Review dispatch must fail closed just like ready
-            # dispatch if branch/base readback changes underneath it.
-            set_workspace_path(conn, claimed.id, str(workspace))
-            if claimed.workspace_kind == "worktree":
-                final_branch = (
-                    resolved_branch_name
-                    or (claimed.branch_name or "").strip()
-                    or f"wt/{claimed.id}"
-                )
-                set_branch_name(conn, claimed.id, final_branch)
-                _record_worktree_run_start(
-                    conn, claimed.id, Path(workspace), final_branch,
-                )
+            # Review and ready dispatch share one branch/base stamping path.
+            workspace = _prepare_claimed_workspace(
+                conn, claimed, board=board,
+            )
         except Exception as exc:
             if isinstance(
                 exc, (WorkspaceValidationError, WorktreeProvenanceError)

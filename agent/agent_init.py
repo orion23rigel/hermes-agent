@@ -61,6 +61,10 @@ from utils import base_url_host_matches, is_truthy_value
 logger = logging.getLogger("run_agent")
 
 
+class KanbanPermanentPreflightError(ValueError):
+    """A proven structural worker contract defect that retries cannot repair."""
+
+
 def _ra():
     """Lazy reference to ``run_agent`` so callers can patch
     ``run_agent.OpenAI`` / ``run_agent.cleanup_vm`` / ... and have those
@@ -119,10 +123,18 @@ def _preflight_kanban_compression(agent: Any) -> None:
     if not (os.getenv("HERMES_KANBAN_TASK") or "").strip():
         return
     from agent.conversation_compression import (
+        CompressionContextTooSmallError,
+        CompressionRouteUnavailableError,
         check_compression_model_feasibility,
     )
 
-    check_compression_model_feasibility(agent)
+    try:
+        check_compression_model_feasibility(agent, strict=True)
+    except (
+        CompressionContextTooSmallError,
+        CompressionRouteUnavailableError,
+    ) as exc:
+        raise KanbanPermanentPreflightError(str(exc)) from exc
     agent._compression_feasibility_checked = True
 
 
@@ -136,25 +148,27 @@ def _preflight_kanban_runtime(agent: Any) -> None:
     available_tools = set(getattr(agent, "valid_tool_names", set()) or set())
     missing_tools = sorted(required_tools - available_tools)
     if missing_tools:
-        raise ValueError(
+        raise KanbanPermanentPreflightError(
             "Kanban worker profile is missing required lifecycle tools: "
             + ", ".join(missing_tools)
         )
 
     workspace = (os.getenv("HERMES_KANBAN_WORKSPACE") or "").strip()
     if not os.path.isabs(workspace) or not os.path.isdir(workspace):
-        raise ValueError(
+        raise KanbanPermanentPreflightError(
             "Kanban worker requires an existing absolute "
             "HERMES_KANBAN_WORKSPACE"
         )
     if not os.access(workspace, os.R_OK | os.W_OK | os.X_OK):
-        raise ValueError(f"Kanban workspace is not writable: {workspace!r}")
+        raise KanbanPermanentPreflightError(
+            f"Kanban workspace is not writable: {workspace!r}"
+        )
 
     run_raw = (os.getenv("HERMES_KANBAN_RUN_ID") or "").strip()
     claim_lock = (os.getenv("HERMES_KANBAN_CLAIM_LOCK") or "").strip()
     db_path = (os.getenv("HERMES_KANBAN_DB") or "").strip()
     if not run_raw.isdigit() or not claim_lock or not os.path.isabs(db_path):
-        raise ValueError(
+        raise KanbanPermanentPreflightError(
             "Kanban worker requires pinned DB, run-id, and claim-lock metadata"
         )
     from hermes_cli import kanban_db as _kb
@@ -174,7 +188,7 @@ def _preflight_kanban_runtime(agent: Any) -> None:
     finally:
         lease_conn.close()
     if lease_state != "active":
-        raise ValueError(
+        raise KanbanPermanentPreflightError(
             f"Kanban worker lease is {lease_state}; refusing stale execution"
         )
 
@@ -185,15 +199,17 @@ def _preflight_kanban_runtime(agent: Any) -> None:
     is_git_workspace = os.path.exists(os.path.join(workspace, ".git"))
     if backend == "docker":
         if terminal.get("docker_persist_across_processes") is not False:
-            raise ValueError("Kanban Docker sandbox must be attempt-scoped")
+            raise KanbanPermanentPreflightError(
+                "Kanban Docker sandbox must be attempt-scoped"
+            )
         mounts = set(terminal.get("docker_volumes") or [])
         exact_mount = f"{os.path.realpath(workspace)}:{os.path.realpath(workspace)}"
         if exact_mount not in mounts:
-            raise ValueError(
+            raise KanbanPermanentPreflightError(
                 "Kanban Docker sandbox is missing the exact-path workspace mount"
             )
     elif backend != "local":
-        raise ValueError(
+        raise KanbanPermanentPreflightError(
             f"Kanban backend {backend!r} has no validated workspace/readback "
             "contract; use local or Docker"
         )
@@ -209,13 +225,13 @@ def _preflight_kanban_runtime(agent: Any) -> None:
             check=False,
         )
         if checked.returncode != 0:
-            raise ValueError(
+            raise RuntimeError(
                 "Kanban worktree Git preflight failed: "
                 f"{checked.stderr.strip() or 'Git metadata unavailable'}"
             )
         expected_branch = (os.getenv("HERMES_KANBAN_BRANCH") or "").strip()
         if not expected_branch:
-            raise ValueError(
+            raise KanbanPermanentPreflightError(
                 "Kanban Git workspace requires a dispatcher-resolved branch"
             )
         if expected_branch:
@@ -229,8 +245,13 @@ def _preflight_kanban_runtime(agent: Any) -> None:
                 check=False,
             )
             actual_branch = branch.stdout.strip()
-            if branch.returncode != 0 or actual_branch != expected_branch:
-                raise ValueError(
+            if branch.returncode != 0:
+                raise RuntimeError(
+                    "Kanban worktree branch preflight failed: "
+                    f"{branch.stderr.strip() or 'Git metadata unavailable'}"
+                )
+            if actual_branch != expected_branch:
+                raise KanbanPermanentPreflightError(
                     "Kanban worktree branch preflight mismatch: expected "
                     f"{expected_branch!r}, found {actual_branch or 'unknown'!r}"
                 )
@@ -251,11 +272,11 @@ def _preflight_kanban_runtime(agent: Any) -> None:
         try:
             smoke = _json.loads(smoke_raw)
         except (TypeError, ValueError, _json.JSONDecodeError) as exc:
-            raise ValueError(
+            raise RuntimeError(
                 "Kanban Docker startup smoke test returned invalid output"
             ) from exc
         if int(smoke.get("exit_code", -1)) != 0:
-            raise ValueError(
+            raise RuntimeError(
                 "Kanban Docker startup smoke test failed: "
                 f"{smoke.get('error') or smoke.get('output') or 'unknown error'}"
             )

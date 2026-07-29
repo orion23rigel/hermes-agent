@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import sqlite3
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -290,6 +291,32 @@ def test_supersede_subtree_is_atomic_and_never_promotes_descendants(kanban_home)
             ).fetchone()
 
 
+def test_supersession_rejects_archived_or_already_superseded_replacement(kanban_home):
+    with kb.connect() as conn:
+        root_id = kb.create_task(conn, title="root")
+        archived_id = kb.create_task(conn, title="archived replacement")
+        assert kb.archive_task(conn, archived_id)
+        with pytest.raises(ValueError, match="replacement.*archived"):
+            kb.supersede_subtree(conn, root_id, archived_id)
+
+        prior_root = kb.create_task(conn, title="prior root")
+        prior_replacement = kb.create_task(conn, title="prior replacement")
+        already_superseded = kb.create_task(conn, title="already superseded")
+        kb.supersede_subtree(conn, already_superseded, prior_replacement)
+        with pytest.raises(ValueError, match="replacement.*superseded"):
+            kb.supersede_subtree(conn, prior_root, already_superseded)
+
+
+def test_delete_archived_refuses_replacement_still_referenced(kanban_home):
+    with kb.connect() as conn:
+        root_id = kb.create_task(conn, title="old root")
+        replacement_id = kb.create_task(conn, title="replacement")
+        kb.supersede_subtree(conn, root_id, replacement_id)
+        assert kb.archive_task(conn, replacement_id)
+        assert kb.delete_archived_task(conn, replacement_id) is False
+        assert kb.get_task(conn, replacement_id) is not None
+
+
 def test_supersede_fences_a_spawn_already_in_progress(
     kanban_home, monkeypatch
 ):
@@ -549,6 +576,108 @@ def test_single_parent_worktree_starts_from_validated_parent_result(
         assert (child_workspace / "foundation.txt").read_text() == "foundation\n"
 
 
+def test_cli_claim_materializes_and_stamps_worktree_provenance(
+    kanban_home, tmp_path, monkeypatch
+):
+    """Human-pulled worktree claims use the same branch/start contract as dispatch."""
+    from hermes_cli import kanban as kanban_cli
+
+    repo = tmp_path / "claim-repository"
+    _init_git_repo(repo)
+    kb.create_board("claim-provenance", default_workdir=str(repo))
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "claim-provenance")
+    with kb.connect(board="claim-provenance") as conn:
+        task_id = kb.create_task(
+            conn, title="human pulled implementation", assignee="terminal-lane",
+            workspace_kind="worktree", board="claim-provenance",
+        )
+
+    output = kanban_cli.run_slash(f"claim {task_id}")
+    assert f"Claimed {task_id}" in output
+    with kb.connect(board="claim-provenance") as conn:
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "running"
+        assert task.branch_name == f"wt/{task_id}"
+        workspace = Path(task.workspace_path)
+        assert workspace.is_dir()
+        assert _git(workspace, "branch", "--show-current") == task.branch_name
+        run = kb.latest_run(conn, task_id)
+        assert run.metadata["worktree_start"] == {
+            "workspace_path": str(workspace.resolve()),
+            "git_common_dir": str((repo / ".git").resolve()),
+            "branch": task.branch_name,
+            "base_sha": _git(workspace, "rev-parse", "HEAD"),
+        }
+
+
+def test_worktree_lineage_allows_archived_scratch_parent_and_one_code_parent(
+    kanban_home, tmp_path, monkeypatch
+):
+    """Non-code dependency semantics must not be mistaken for Git fan-in."""
+    import hermes_cli.profiles as profiles
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda _name: True)
+    repo = tmp_path / "mixed-parent-repository"
+    _init_git_repo(repo)
+    kb.create_board("mixed-parents", default_workdir=str(repo))
+    with kb.connect(board="mixed-parents") as conn:
+        scratch_id = kb.create_task(conn, title="research", workspace_kind="scratch")
+        assert kb.archive_task(conn, scratch_id)
+        code_id = kb.create_task(
+            conn, title="code foundation", assignee="engineer",
+            workspace_kind="worktree", board="mixed-parents",
+        )
+        kb.dispatch_once(conn, board="mixed-parents", spawn_fn=lambda *_a, **_k: None)
+        code = kb.get_task(conn, code_id)
+        code_workspace = Path(code.workspace_path)
+        (code_workspace / "code.txt").write_text("trusted\n", encoding="utf-8")
+        _git(code_workspace, "add", "code.txt")
+        _git(code_workspace, "commit", "-m", "trusted parent")
+        trusted_sha = _git(code_workspace, "rev-parse", "HEAD")
+        assert kb.complete_task(conn, code_id, result="trusted code")
+
+        child_id = kb.create_task(
+            conn, title="mixed dependency child", assignee="engineer",
+            workspace_kind="worktree", parents=[scratch_id, code_id],
+            board="mixed-parents",
+        )
+        result = kb.dispatch_once(
+            conn, board="mixed-parents", spawn_fn=lambda *_a, **_k: None,
+        )
+        assert [item[0] for item in result.spawned] == [child_id]
+        child = kb.get_task(conn, child_id)
+        assert _git(Path(child.workspace_path), "rev-parse", "HEAD") == trusted_sha
+        assert kb.latest_run(conn, child_id).metadata["worktree_start"]["base_sha"] == trusted_sha
+
+
+def test_worktree_lineage_rejects_multiple_code_parents_even_with_scratch(
+    kanban_home, tmp_path
+):
+    repo = tmp_path / "multi-code-parent-repository"
+    _init_git_repo(repo)
+    kb.create_board("multi-code-parents", default_workdir=str(repo))
+    with kb.connect(board="multi-code-parents") as conn:
+        scratch_id = kb.create_task(conn, title="research")
+        conn.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (scratch_id,))
+        code_ids = []
+        for title in ("code a", "code b"):
+            tid = kb.create_task(
+                conn, title=title, workspace_kind="worktree",
+                workspace_path=str(repo), board="multi-code-parents",
+            )
+            conn.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (tid,))
+            code_ids.append(tid)
+        child_id = kb.create_task(
+            conn, title="ambiguous fan-in", workspace_kind="worktree",
+            workspace_path=str(repo), parents=[scratch_id, *code_ids],
+            board="multi-code-parents",
+        )
+        child = kb.get_task(conn, child_id)
+        with pytest.raises(kb.WorkspaceValidationError, match="multiple worktree-producing"):
+            kb._resolve_worktree_workspace(child, board="multi-code-parents", conn=conn)
+
+
 def test_missing_worktree_parent_provenance_blocks_child_before_spawn(
     kanban_home, tmp_path, monkeypatch
 ):
@@ -775,19 +904,192 @@ def test_kanban_compression_feasibility_is_eager(monkeypatch):
     fake_agent = SimpleNamespace(_compression_feasibility_checked=False)
     monkeypatch.setenv("HERMES_KANBAN_TASK", "t_compression")
 
-    def reject(agent):
+    def reject(agent, *, strict=False):
         calls.append(agent)
-        raise ValueError("auxiliary compression model is below 64K")
+        raise compression.CompressionContextTooSmallError(
+            "auxiliary compression model is below 64K"
+        )
 
     monkeypatch.setattr(compression, "check_compression_model_feasibility", reject)
-    with pytest.raises(ValueError, match="below 64K"):
+    with pytest.raises(ValueError, match="below 64K") as exc_info:
         agent_init._preflight_kanban_compression(fake_agent)
+    assert type(exc_info.value).__name__ == "KanbanPermanentPreflightError"
     assert calls == [fake_agent]
 
     calls.clear()
     monkeypatch.delenv("HERMES_KANBAN_TASK")
     agent_init._preflight_kanban_compression(fake_agent)
     assert calls == []
+
+
+def test_kanban_compression_requires_an_auxiliary_route(monkeypatch):
+    import agent.agent_init as agent_init
+    import agent.conversation_compression as compression
+
+    fake_agent = SimpleNamespace(_compression_feasibility_checked=False)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_no_aux")
+    monkeypatch.setattr(
+        compression,
+        "check_compression_model_feasibility",
+        lambda _agent, *, strict=False: (_ for _ in ()).throw(
+            compression.CompressionRouteUnavailableError("no auxiliary route")
+        ),
+    )
+    with pytest.raises(agent_init.KanbanPermanentPreflightError, match="no auxiliary route"):
+        agent_init._preflight_kanban_compression(fake_agent)
+    assert fake_agent._compression_feasibility_checked is False
+
+
+def test_kanban_compression_indeterminate_probe_is_retryable(monkeypatch):
+    import agent.agent_init as agent_init
+    import agent.conversation_compression as compression
+
+    fake_agent = SimpleNamespace(_compression_feasibility_checked=False)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_probe_outage")
+    monkeypatch.setattr(
+        compression,
+        "check_compression_model_feasibility",
+        lambda _agent, *, strict=False: (_ for _ in ()).throw(
+            compression.CompressionFeasibilityIndeterminateError("metadata timeout")
+        ),
+    )
+    with pytest.raises(RuntimeError, match="metadata timeout") as exc_info:
+        agent_init._preflight_kanban_compression(fake_agent)
+    assert not isinstance(exc_info.value, agent_init.KanbanPermanentPreflightError)
+    assert fake_agent._compression_feasibility_checked is False
+
+
+def test_structural_worker_preflight_has_a_typed_permanent_failure(monkeypatch):
+    """Missing lifecycle tools are structural, not an arbitrary ValueError."""
+    import agent.agent_init as agent_init
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_missing_lifecycle")
+    agent = SimpleNamespace(valid_tool_names={"kanban_show"})
+
+    with pytest.raises(ValueError, match="missing required lifecycle tools") as exc_info:
+        agent_init._preflight_kanban_runtime(agent)
+
+    assert type(exc_info.value).__name__ == "KanbanPermanentPreflightError"
+
+
+@pytest.mark.parametrize(
+    "startup_error",
+    [
+        RuntimeError("credential pool temporarily unavailable"),
+        subprocess.TimeoutExpired("docker run", 20),
+    ],
+)
+def test_arbitrary_agent_startup_failures_keep_retryable_exit_marker(
+    kanban_home, monkeypatch, startup_error
+):
+    """Constructor/runtime outages must never inherit permanent EX_CONFIG."""
+    import cli as cli_mod
+    from hermes_cli import mcp_startup
+
+    shell = cli_mod.HermesCLI(compact=True)
+    shell._session_db = object()
+    shell._resumed = False
+    shell.conversation_history = []
+    shell._install_tool_callbacks = lambda: None
+    shell._ensure_tirith_security = lambda: None
+    shell._ensure_runtime_credentials = lambda: True
+
+    monkeypatch.setattr(cli_mod, "_prepare_deferred_agent_startup", lambda: None)
+    monkeypatch.setattr(mcp_startup, "wait_for_mcp_discovery", lambda: None)
+
+    def reject(*_args, **_kwargs):
+        raise startup_error
+
+    monkeypatch.setattr(cli_mod, "AIAgent", reject)
+
+    assert shell._init_agent() is False
+    assert getattr(shell, "_agent_init_exit_code", None) == 1
+
+
+def test_typed_structural_startup_sets_permanent_exit_marker(
+    kanban_home, monkeypatch
+):
+    """The explicit permanent preflight type is the only EX_CONFIG source."""
+    import agent.agent_init as agent_init
+    import cli as cli_mod
+    from hermes_cli import mcp_startup
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_missing_lifecycle")
+    with pytest.raises(ValueError) as exc_info:
+        agent_init._preflight_kanban_runtime(
+            SimpleNamespace(valid_tool_names={"kanban_show"})
+        )
+    assert type(exc_info.value).__name__ == "KanbanPermanentPreflightError"
+
+    shell = cli_mod.HermesCLI(compact=True)
+    shell._session_db = object()
+    shell._resumed = False
+    shell.conversation_history = []
+    shell._install_tool_callbacks = lambda: None
+    shell._ensure_tirith_security = lambda: None
+    shell._ensure_runtime_credentials = lambda: True
+
+    monkeypatch.setattr(cli_mod, "_prepare_deferred_agent_startup", lambda: None)
+    monkeypatch.setattr(mcp_startup, "wait_for_mcp_discovery", lambda: None)
+
+    def reject(*_args, **_kwargs):
+        raise exc_info.value
+
+    monkeypatch.setattr(cli_mod, "AIAgent", reject)
+
+    assert shell._init_agent() is False
+    assert (
+        shell._agent_init_exit_code
+        == kb.KANBAN_PERMANENT_FAILURE_EXIT_CODE
+    )
+
+
+def test_kanban_docker_smoke_timeout_is_retryable(
+    kanban_home, tmp_path, monkeypatch
+):
+    """A Docker daemon/runtime timeout is not a structural preflight defect."""
+    import agent.agent_init as agent_init
+    from tools import terminal_tool as terminal
+
+    workspace = tmp_path / "docker-smoke-workspace"
+    workspace.mkdir()
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="docker smoke timeout",
+            workspace_kind="dir",
+            workspace_path=str(workspace),
+        )
+        task = kb.claim_task(conn, task_id)
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(workspace))
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(task.current_run_id))
+    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", str(task.claim_lock))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(kb.kanban_db_path()))
+    resolved = workspace.resolve()
+    monkeypatch.setattr(
+        terminal,
+        "_get_env_config",
+        lambda: {
+            "env_type": "docker",
+            "docker_persist_across_processes": False,
+            "docker_volumes": [f"{resolved}:{resolved}"],
+        },
+    )
+    monkeypatch.setattr(
+        terminal,
+        "terminal_tool",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            subprocess.TimeoutExpired("docker exec", 20)
+        ),
+    )
+
+    agent = SimpleNamespace(
+        valid_tool_names={"kanban_show", "kanban_complete", "kanban_block"}
+    )
+    with pytest.raises(subprocess.TimeoutExpired):
+        agent_init._preflight_kanban_runtime(agent)
 
 
 def test_permanent_worker_startup_exit_is_classified_without_retry(monkeypatch):
@@ -831,6 +1133,28 @@ def test_quiet_worker_cannot_exit_zero_before_terminal_transition(
     with kb.connect() as conn:
         assert kb.complete_task(conn, task_id, result="terminal lifecycle call")
     assert cli._kanban_worker_terminal_exit_code(0) == 0
+
+
+def test_worker_terminal_readback_exception_is_retryable_protocol_failure(
+    monkeypatch,
+):
+    import cli
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_readback_error")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "1")
+    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", "claim")
+    monkeypatch.setattr(
+        kb,
+        "connect",
+        lambda: (_ for _ in ()).throw(
+            sqlite3.OperationalError("temporary database outage")
+        ),
+    )
+
+    assert (
+        cli._kanban_worker_terminal_exit_code(0)
+        == kb.KANBAN_PROTOCOL_FAILURE_EXIT_CODE
+    )
 
 
 def test_worker_lease_readback_fences_reclaimed_attempt(kanban_home):

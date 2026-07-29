@@ -8,7 +8,9 @@ operator footgun that only manifests in long-running setups.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import os
+import shutil
 import sys
 import tempfile
 from types import SimpleNamespace
@@ -17,16 +19,44 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 
-@pytest.fixture()
-def isolated_kanban_home(monkeypatch):
-    """Spin up a fresh HERMES_HOME with a clean kanban DB."""
+def _kanban_module_names():
+    return [
+        mod
+        for mod in sys.modules
+        if mod.startswith("hermes_cli") or mod.startswith("hermes_state") or mod == "hermes_constants"
+    ]
+
+
+@contextlib.contextmanager
+def _isolated_kanban_home_ctx(monkeypatch):
+    """Spin up a fresh HERMES_HOME with a clean kanban DB.
+
+    Deleting hermes_cli/hermes_state/hermes_constants from sys.modules forces
+    a reimport under the temp HERMES_HOME, but that reimport must not leak
+    into other test files: we save the original module objects and restore
+    them afterward, and drop whatever got (re)imported during the test so a
+    stale module object never outlives this fixture.
+    """
     test_home = tempfile.mkdtemp(prefix="kanban_cli_passthrough_")
     os.makedirs(os.path.join(test_home, "profiles", "default"), exist_ok=True)
     monkeypatch.setenv("HERMES_HOME", test_home)
-    for mod in list(sys.modules.keys()):
-        if mod.startswith("hermes_cli") or mod.startswith("hermes_state") or mod == "hermes_constants":
-            del sys.modules[mod]
-    yield test_home
+
+    saved_modules = {name: sys.modules[name] for name in _kanban_module_names()}
+    for name in saved_modules:
+        del sys.modules[name]
+    try:
+        yield test_home
+    finally:
+        for name in _kanban_module_names():
+            del sys.modules[name]
+        sys.modules.update(saved_modules)
+        shutil.rmtree(test_home, ignore_errors=True)
+
+
+@pytest.fixture()
+def isolated_kanban_home(monkeypatch):
+    with _isolated_kanban_home_ctx(monkeypatch) as test_home:
+        yield test_home
 
 
 def test_cli_dispatch_passes_max_in_progress_from_config(isolated_kanban_home, monkeypatch):
@@ -114,6 +144,30 @@ def test_cli_invalid_max_in_progress_silently_disables(isolated_kanban_home, mon
             f"invalid max_in_progress={bad_val!r} should fall through to None, "
             f"got {captured.get('max_in_progress')!r}"
         )
+
+
+def test_isolated_kanban_home_restores_original_modules(isolated_kanban_home):
+    """The fixture must not leak reimported hermes_cli/hermes_state/
+    hermes_constants module objects past the test — a stale module object
+    left in sys.modules causes collection-time references in other test
+    files to diverge from the module actually used at runtime (module-state
+    leak that broke test_kanban_db.py when run after this file)."""
+    import hermes_cli  # noqa: F401 — force (re)import inside the fixture
+
+    assert "hermes_cli" in sys.modules
+
+
+def test_isolated_kanban_home_cleans_up_after_test(monkeypatch):
+    """After the fixture tears down, sys.modules must be back to whatever
+    it held before the fixture ran, and the temp HERMES_HOME must be gone."""
+    pre_state = {name: sys.modules.get(name) for name in _kanban_module_names()}
+
+    with _isolated_kanban_home_ctx(monkeypatch) as test_home:
+        import hermes_cli  # noqa: F401 — force (re)import inside the context
+
+    post_state = {name: sys.modules.get(name) for name in _kanban_module_names()}
+    assert post_state == pre_state, "sys.modules must be restored to its pre-fixture state"
+    assert not os.path.exists(test_home), "temp HERMES_HOME must be removed after teardown"
 
 
 def test_kanban_swarm_uses_existing_humanizer_skill():

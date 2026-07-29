@@ -4444,6 +4444,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
         # Agent will be initialized on first use
         self.agent: Optional[Any] = None
+        self._agent_init_exit_code = 1
         self._tool_callbacks_installed = False
         self._tirith_security_checked = False
         self._app = None  # prompt_toolkit Application (set in run())
@@ -17058,9 +17059,11 @@ def _kanban_worker_terminal_exit_code(default_code: int) -> int:
     """Refuse rc=0 while the exact dispatched attempt still owns the card."""
     if default_code != 0 or not os.environ.get("HERMES_KANBAN_TASK"):
         return default_code
+    protocol_failure_code = 76
     try:
         from hermes_cli import kanban_db as _kb_exit
 
+        protocol_failure_code = _kb_exit.KANBAN_PROTOCOL_FAILURE_EXIT_CODE
         run_id = int(os.environ.get("HERMES_KANBAN_RUN_ID", ""))
         claim = os.environ.get("HERMES_KANBAN_CLAIM_LOCK", "")
         conn = _kb_exit.connect()
@@ -17078,12 +17081,12 @@ def _kanban_worker_terminal_exit_code(default_code: int) -> int:
         finally:
             conn.close()
         if lease == "active":
-            return _kb_exit.KANBAN_PROTOCOL_FAILURE_EXIT_CODE
+            return protocol_failure_code
         return default_code
     except Exception:
-        # Missing/corrupt worker lease metadata is a deterministic
-        # startup/contract failure, not a successful conversational exit.
-        return 78
+        # Runtime DB/readback failures do not prove a structural mismatch.
+        # Keep the attempt retryable while still refusing a false rc=0.
+        return protocol_failure_code
 
 
 def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
@@ -17678,21 +17681,10 @@ def main(
                         )
                         sys.exit(_exit_code)
 
-                # Fail-closed Kanban startup preflight (credentials, profile
-                # route, compression model, sandbox config) is deterministic
-                # for the current deployment. EX_CONFIG lets the dispatcher
-                # block once instead of launching the same broken worker
-                # three times. Ordinary CLI automation keeps its historical
-                # generic rc=1 contract.
-                if os.environ.get("HERMES_KANBAN_TASK"):
-                    try:
-                        from hermes_cli.kanban_db import (
-                            KANBAN_PERMANENT_FAILURE_EXIT_CODE as _CONFIG_CODE,
-                        )
-                    except Exception:
-                        _CONFIG_CODE = 78
-                    sys.exit(_CONFIG_CODE)
-                sys.exit(1)
+                # `_init_agent()` classifies only proven structural Kanban
+                # preflight defects as permanent. Credentials, Docker, Git,
+                # process, and DB/runtime failures retain the retryable default.
+                sys.exit(getattr(cli, "_agent_init_exit_code", 1))
             else:
                 # Single-query mode (`hermes chat -q "…"`): skip the welcome
                 # banner. Building the banner takes ~420 ms on cold start —
@@ -17715,6 +17707,12 @@ def main(
                 cli._show_security_advisories()
                 cli.chat(query, images=single_query_images or None)
                 cli._print_exit_summary(clear_screen=False)
+                # ``chat`` is side-effecting and historically returns None even
+                # after a successful human query. Initialization failure is
+                # represented by the agent remaining absent plus the classified
+                # marker set by ``_init_agent``.
+                if cli.agent is None:
+                    sys.exit(getattr(cli, "_agent_init_exit_code", 1))
         finally:
             _finalize_single_query(cli)
         return

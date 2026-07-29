@@ -1019,6 +1019,7 @@ def _probe_remote_backend(env_type: str) -> str | None:
         _BACKEND_PROBE_CACHE[cache_key] = ""
         return None
 
+    env = None
     try:
         config = _get_env_config()
         # Build the environment the same way tools/terminal_tool.py does for a
@@ -1095,6 +1096,36 @@ def _probe_remote_backend(env_type: str) -> str | None:
         logger.debug("Backend probe failed: %s", e)
         _BACKEND_PROBE_CACHE[cache_key] = ""
         return None
+    finally:
+        # This environment exists only for one prompt introspection command.
+        # Never leave a persistent Docker container or remote sandbox behind,
+        # including on early returns and execute failures.
+        if env is not None:
+            cleanup = getattr(env, "cleanup", None)
+            if callable(cleanup):
+                try:
+                    cleanup(force_remove=True)
+                except TypeError:
+                    # Non-Docker environment implementations expose cleanup()
+                    # without the Docker-specific force_remove keyword.
+                    try:
+                        cleanup()
+                    except Exception as cleanup_error:
+                        logger.debug("Backend probe cleanup failed: %s", cleanup_error)
+                except Exception as cleanup_error:
+                    logger.debug("Backend probe cleanup failed: %s", cleanup_error)
+                # Docker cleanup is asynchronous for non-Kanban environments.
+                # This probe environment is not registered in terminal_tool's
+                # atexit registry, so wait here or the daemon cleanup thread can
+                # die with the short-lived CLI process and leave the container.
+                wait_for_cleanup = getattr(env, "wait_for_cleanup", None)
+                if callable(wait_for_cleanup):
+                    try:
+                        wait_for_cleanup(timeout=60.0)
+                    except Exception as cleanup_error:
+                        logger.debug(
+                            "Backend probe cleanup wait failed: %s", cleanup_error
+                        )
 
     # Parse key=value lines back into a tidy summary.
     parsed: dict[str, str] = {}

@@ -142,6 +142,18 @@ ROUTINE_COMPRESSION_STATUS_SAMPLES = (
 )
 
 
+class CompressionRouteUnavailableError(ValueError):
+    """No configured auxiliary route can execute compression."""
+
+
+class CompressionContextTooSmallError(ValueError):
+    """The resolved auxiliary model is deterministically below the 64K floor."""
+
+
+class CompressionFeasibilityIndeterminateError(RuntimeError):
+    """The auxiliary route exists but its feasibility could not be established."""
+
+
 def _builtin_memory_prompt_snapshot(agent: Any) -> Optional[Tuple[str, str]]:
     """Return the built-in memory text that can affect a system prompt.
 
@@ -704,7 +716,7 @@ class _CompressionLockLeaseRefresher:
                 break
 
 
-def check_compression_model_feasibility(agent: Any) -> None:
+def check_compression_model_feasibility(agent: Any, *, strict: bool = False) -> None:
     """Warn at session start if the auxiliary compression model's context
     window is smaller than the main model's compression threshold.
 
@@ -773,6 +785,8 @@ def check_compression_model_feasibility(agent: Any) -> None:
                 "No auxiliary LLM provider for compression — "
                 "summaries will be unavailable."
             )
+            if strict:
+                raise CompressionRouteUnavailableError(msg)
             return
 
         aux_base_url = str(getattr(client, "base_url", ""))
@@ -797,6 +811,11 @@ def check_compression_model_feasibility(agent: Any) -> None:
             provider=(_aux_cfg_provider if _aux_cfg_provider and _aux_cfg_provider != "auto" else getattr(agent, "provider", "")),
             custom_providers=agent._custom_providers,
         )
+        if not aux_context:
+            raise CompressionFeasibilityIndeterminateError(
+                f"Could not determine context length for auxiliary compression "
+                f"model {aux_model!r}"
+            )
 
         # Hard floor: the auxiliary compression model must have at least
         # MINIMUM_CONTEXT_LENGTH (64K) tokens of context.  The main model
@@ -805,7 +824,7 @@ def check_compression_model_feasibility(agent: Any) -> None:
         # cannot summarise a full threshold-sized window of main-model
         # content.  Mirrors the main-model rejection pattern.
         if aux_context and aux_context < MINIMUM_CONTEXT_LENGTH:
-            raise ValueError(
+            raise CompressionContextTooSmallError(
                 f"Auxiliary compression model {aux_model} has a context "
                 f"window of {aux_context:,} tokens, which is below the "
                 f"minimum {MINIMUM_CONTEXT_LENGTH:,} required by Hermes "
@@ -946,11 +965,17 @@ def check_compression_model_feasibility(agent: Any) -> None:
                 old_threshold,
                 new_threshold,
             )
-    except ValueError:
-        # Hard rejections (aux below minimum context) must propagate
-        # so the session refuses to start.
+    except (CompressionRouteUnavailableError, CompressionContextTooSmallError):
+        # Proven structural rejections must propagate so strict callers can
+        # refuse startup; normal interactive sessions keep their existing warning.
         raise
     except Exception as exc:
+        if strict:
+            if isinstance(exc, CompressionFeasibilityIndeterminateError):
+                raise
+            raise CompressionFeasibilityIndeterminateError(
+                f"Compression feasibility probe failed: {exc}"
+            ) from exc
         logger.debug(
             "Compression feasibility check failed (non-fatal): %s", exc
         )

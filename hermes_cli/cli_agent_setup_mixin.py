@@ -236,6 +236,7 @@ class CLIAgentSetupMixin:
             bool: True if successful, False otherwise
         """
         from cli import AIAgent, ChatConsole, _DIM, _RST, _accent_hex, _cprint, _prepare_deferred_agent_startup, logger
+        self._agent_init_exit_code = 1
         if self.agent is not None:
             return True
 
@@ -458,6 +459,16 @@ class CLIAgentSetupMixin:
                     # Keep _pending_title so it can be retried after row creation succeeds
             return True
         except Exception as e:
+            from agent.agent_init import KanbanPermanentPreflightError
+
+            if isinstance(e, KanbanPermanentPreflightError):
+                from hermes_cli.kanban_db import (
+                    KANBAN_PERMANENT_FAILURE_EXIT_CODE,
+                )
+
+                self._agent_init_exit_code = (
+                    KANBAN_PERMANENT_FAILURE_EXIT_CODE
+                )
             ChatConsole().print(f"[bold red]Failed to initialize agent: {e}[/]")
             return False
 

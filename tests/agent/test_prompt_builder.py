@@ -1375,6 +1375,149 @@ class TestEnvironmentHints:
         assert "Linux 6.8.0" in line
         assert "root" in line
 
+    def test_probe_remote_backend_cleans_up_on_success(self, monkeypatch):
+        """The probe must tear down the disposable environment it creates.
+
+        Regression for a leak where a Docker container (task_id
+        "prompt-backend-probe") was left running after every probe because
+        the environment was never cleaned up. Docker-like environments whose
+        cleanup() accepts force_remove must be force-removed.
+        """
+        import agent.prompt_builder as _pb
+
+        monkeypatch.setenv("TERMINAL_ENV", "docker")
+        _pb._clear_backend_probe_cache()
+
+        cleanup_calls = []
+        cleanup_waits = []
+
+        class _FakeDockerEnv:
+            def execute(self, cmd, timeout=None):
+                return {
+                    "returncode": 0,
+                    "output": "os=Linux\nkernel=6.8.0\nhome=/root\ncwd=/workspace\nuser=root\n",
+                }
+
+            def cleanup(self, *, force_remove=False):
+                cleanup_calls.append({"force_remove": force_remove})
+
+            def wait_for_cleanup(self, timeout):
+                cleanup_waits.append(timeout)
+                return True
+
+        import tools.terminal_tool as _tt
+        monkeypatch.setattr(_tt, "_create_environment", lambda *, env_type, **kwargs: _FakeDockerEnv())
+
+        line = _pb._probe_remote_backend("docker")
+
+        assert line is not None
+        assert len(cleanup_calls) == 1
+        assert cleanup_calls[0]["force_remove"] is True
+        assert cleanup_waits == [60.0]
+
+    def test_probe_remote_backend_cleans_up_on_nonzero_exit(self, monkeypatch):
+        """A failed probe command must still clean up the environment it created."""
+        import agent.prompt_builder as _pb
+
+        monkeypatch.setenv("TERMINAL_ENV", "docker")
+        _pb._clear_backend_probe_cache()
+
+        cleanup_calls = []
+
+        class _FakeDockerEnv:
+            def execute(self, cmd, timeout=None):
+                return {"returncode": 1, "output": ""}
+
+            def cleanup(self, *, force_remove=False):
+                cleanup_calls.append({"force_remove": force_remove})
+
+        import tools.terminal_tool as _tt
+        monkeypatch.setattr(_tt, "_create_environment", lambda *, env_type, **kwargs: _FakeDockerEnv())
+
+        line = _pb._probe_remote_backend("docker")
+
+        assert line is None
+        assert len(cleanup_calls) == 1
+        assert cleanup_calls[0]["force_remove"] is True
+
+    def test_probe_remote_backend_cleans_up_on_empty_output(self, monkeypatch):
+        """A probe that returns zero but empty output must still be cleaned up."""
+        import agent.prompt_builder as _pb
+
+        monkeypatch.setenv("TERMINAL_ENV", "docker")
+        _pb._clear_backend_probe_cache()
+
+        cleanup_calls = []
+
+        class _FakeDockerEnv:
+            def execute(self, cmd, timeout=None):
+                return {"returncode": 0, "output": "   "}
+
+            def cleanup(self, *, force_remove=False):
+                cleanup_calls.append({"force_remove": force_remove})
+
+        import tools.terminal_tool as _tt
+        monkeypatch.setattr(_tt, "_create_environment", lambda *, env_type, **kwargs: _FakeDockerEnv())
+
+        line = _pb._probe_remote_backend("docker")
+
+        assert line is None
+        assert len(cleanup_calls) == 1
+
+    def test_probe_remote_backend_cleans_up_on_exception(self, monkeypatch):
+        """If execute() raises, the environment must still be cleaned up (no leak)."""
+        import agent.prompt_builder as _pb
+
+        monkeypatch.setenv("TERMINAL_ENV", "docker")
+        _pb._clear_backend_probe_cache()
+
+        cleanup_calls = []
+
+        class _FakeDockerEnv:
+            def execute(self, cmd, timeout=None):
+                raise RuntimeError("boom")
+
+            def cleanup(self, *, force_remove=False):
+                cleanup_calls.append({"force_remove": force_remove})
+
+        import tools.terminal_tool as _tt
+        monkeypatch.setattr(_tt, "_create_environment", lambda *, env_type, **kwargs: _FakeDockerEnv())
+
+        line = _pb._probe_remote_backend("docker")
+
+        assert line is None
+        assert len(cleanup_calls) == 1
+        assert cleanup_calls[0]["force_remove"] is True
+
+    def test_probe_remote_backend_falls_back_to_plain_cleanup(self, monkeypatch):
+        """Environments whose cleanup() doesn't accept force_remove (e.g. SSH,
+        Modal, Singularity, Daytona) must still get cleaned up, via a plain
+        cleanup() call, without masking the probe result."""
+        import agent.prompt_builder as _pb
+
+        monkeypatch.setenv("TERMINAL_ENV", "ssh")
+        _pb._clear_backend_probe_cache()
+
+        cleanup_calls = []
+
+        class _FakePlainEnv:
+            def execute(self, cmd, timeout=None):
+                return {
+                    "returncode": 0,
+                    "output": "os=Linux\nkernel=6.8.0\nhome=/root\ncwd=/workspace\nuser=root\n",
+                }
+
+            def cleanup(self):
+                cleanup_calls.append(True)
+
+        import tools.terminal_tool as _tt
+        monkeypatch.setattr(_tt, "_create_environment", lambda *, env_type, **kwargs: _FakePlainEnv())
+
+        line = _pb._probe_remote_backend("ssh")
+
+        assert line is not None
+        assert cleanup_calls == [True]
+
     def test_remote_backend_list_covers_known_sandboxes(self):
         """Regression guard: if someone adds a remote backend, they must list it here."""
         import agent.prompt_builder as _pb
