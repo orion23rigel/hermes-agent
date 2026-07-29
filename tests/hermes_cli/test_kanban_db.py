@@ -993,7 +993,11 @@ def test_retryable_failure_requeues_counts_and_trips_bounded_breaker(
             )
 
             reclaimed = kb.detect_crashed_workers(conn)
-            assert tid in reclaimed
+            assert tid not in reclaimed
+            retryable = getattr(
+                _kb.detect_crashed_workers, "_last_retryable_failures", []
+            )
+            assert tid in retryable
             task = kb.get_task(conn, tid)
             assert task.consecutive_failures == i + 1
             if i == 0:
@@ -1046,6 +1050,25 @@ def test_respawn_guard_defers_retryable_failure_for_fixed_cooldown(
             lambda: now + _kb.DEFAULT_RETRYABLE_FAILURE_COOLDOWN_SECONDS + 1,
         )
         assert kb.check_respawn_guard(conn, tid) is None
+
+        # Equal-second ordering is deterministic: a newer completed run
+        # supersedes the older retryable failure rather than inheriting its
+        # cooldown merely because both ended in the same SQLite second.
+        kb.claim_task(conn, tid)
+        newer_run_id = kb.get_task(conn, tid).current_run_id
+        conn.execute(
+            "UPDATE task_runs SET outcome='completed', status='completed', "
+            "ended_at=? WHERE id=?",
+            (now, newer_run_id),
+        )
+        conn.execute(
+            "UPDATE tasks SET status='ready', current_run_id=NULL, "
+            "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL WHERE id=?",
+            (tid,),
+        )
+        conn.commit()
+        monkeypatch.setattr(_kb.time, "time", lambda: now + 10)
+        assert kb.check_respawn_guard(conn, tid) == "recent_success"
 
 
 def test_real_crash_still_counts_and_trips_breaker(kanban_home, monkeypatch):

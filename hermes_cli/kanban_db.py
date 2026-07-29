@@ -7532,6 +7532,10 @@ class DispatchResult:
     (EX_TEMPFAIL sentinel exit) and were released back to ``ready`` WITHOUT
     counting a failure. These never trip the circuit breaker — a long quota
     window just makes the task bounce cheaply until the window clears."""
+    retryable_failures: list[str] = field(default_factory=list)
+    """Task ids whose workers exited after a retryable provider request stall.
+    These return to ``ready`` with bounded failure accounting and cooldown;
+    they are not generic process crashes."""
     skipped_locked: bool = False
     """True when this tick was skipped because another process already held
     the board's dispatch lock (issue #35240). A losing dispatcher does no
@@ -8248,6 +8252,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     """
     crashed: list[str] = []
     rate_limited: list[str] = []
+    retryable_failures: list[str] = []
     permanent_auto_blocked: list[str] = []
     # Per-crash details collected inside the main txn, used after it
     # closes to run ``_record_task_failure`` (which needs its own
@@ -8476,7 +8481,10 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                             "WHERE id = ?",
                             (error_text[:500], row["id"]),
                         )
-                    crashed.append(row["id"])
+                    if retryable_failure_exit:
+                        retryable_failures.append(row["id"])
+                    else:
+                        crashed.append(row["id"])
                     crash_details.append(
                         (row["id"], pid, row["claim_lock"],
                          protocol_violation, permanent_failure, _run_outcome,
@@ -8592,6 +8600,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # Same side-channel for rate-limited requeues — these did NOT count a
     # failure and are NOT crashes, so they stay out of the ``crashed`` return.
     detect_crashed_workers._last_rate_limited = rate_limited  # type: ignore[attr-defined]
+    detect_crashed_workers._last_retryable_failures = retryable_failures  # type: ignore[attr-defined]
     return crashed
 
 
@@ -8935,7 +8944,7 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
     latest_run = conn.execute(
         "SELECT outcome, ended_at FROM task_runs "
         "WHERE task_id = ? AND ended_at IS NOT NULL "
-        "ORDER BY ended_at DESC LIMIT 1",
+        "ORDER BY ended_at DESC, rowid DESC LIMIT 1",
         (task_id,),
     ).fetchone()
     if (
@@ -9205,6 +9214,11 @@ def _dispatch_once_locked(
     )
     if _crash_rate_limited:
         result.rate_limited.extend(_crash_rate_limited)
+    _crash_retryable = getattr(
+        detect_crashed_workers, "_last_retryable_failures", []
+    )
+    if _crash_retryable:
+        result.retryable_failures.extend(_crash_retryable)
     result.timed_out = enforce_max_runtime(conn)
     result.promoted = recompute_ready(conn, failure_limit=failure_limit)
 
