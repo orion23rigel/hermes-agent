@@ -2,6 +2,7 @@
 
 from agent.provider_request_watchdog import (
     PROVIDER_REQUEST_STALLED,
+    ProviderRequestMonitor,
     ProviderRequestStalledError,
 )
 
@@ -85,3 +86,126 @@ def test_provider_request_stalled_error_escapes_control_characters():
     assert r"provider\nforged" in diagnostic
     assert r"model\rforged" in diagnostic
     assert r"request\tforged" in diagnostic
+
+
+class _Clock:
+    def __init__(self) -> None:
+        self.now = 10.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+def test_monitor_deadline_is_fixed_and_progress_only_counts_bytes():
+    clock = _Clock()
+    events = []
+    monitor = ProviderRequestMonitor(
+        provider="p",
+        model="m",
+        timeout_seconds=5.0,
+        event_callback=lambda name, payload: events.append((name, payload)),
+        clock=clock,
+        progress_interval_seconds=1.0,
+    )
+    monitor.begin_attempt(api_request_id="req", retry_count=2)
+    assert monitor.deadline == 15.0
+
+    clock.now = 11.0
+    monitor.record_progress(7)
+    clock.now = 14.9
+    monitor.record_progress(3)
+    assert monitor.deadline == 15.0
+    assert monitor.bytes_received == 10
+    monitor.check_deadline()
+
+    clock.now = 15.0
+    try:
+        monitor.check_deadline()
+    except ProviderRequestStalledError as error:
+        assert error.elapsed_seconds == 5.0
+        assert error.bytes_received == 10
+        assert error.retry_count == 2
+    else:
+        raise AssertionError("deadline did not raise")
+
+    assert [name for name, _ in events] == [
+        "provider_request.started",
+        "provider_request.progress",
+        "provider_request.progress",
+        "provider_request.failed",
+    ]
+
+
+def test_monitor_new_attempt_gets_fresh_deadline_and_terminal_event_once():
+    clock = _Clock()
+    events = []
+    monitor = ProviderRequestMonitor(
+        provider="p",
+        model="m",
+        timeout_seconds=5.0,
+        event_callback=lambda name, payload: events.append((name, payload)),
+        clock=clock,
+    )
+    monitor.begin_attempt(retry_count=0)
+    first_deadline = monitor.deadline
+    monitor.fail(RuntimeError("secret provider payload"))
+    monitor.complete()
+
+    clock.now = 20.0
+    monitor.begin_attempt(retry_count=1)
+    assert monitor.deadline == 25.0
+    assert monitor.deadline != first_deadline
+    monitor.complete()
+    monitor.fail(RuntimeError("late"))
+
+    assert [name for name, _ in events] == [
+        "provider_request.started",
+        "provider_request.failed",
+        "provider_request.started",
+        "provider_request.completed",
+    ]
+    assert events[1][1]["error_code"] == "RuntimeError"
+    assert "secret provider payload" not in repr(events)
+
+
+def test_monitor_callback_failure_is_fail_soft_and_payload_is_allowlisted():
+    clock = _Clock()
+    seen = []
+
+    def callback(name, payload):
+        seen.append((name, payload))
+        raise RuntimeError("sink failed")
+
+    monitor = ProviderRequestMonitor(
+        provider="p",
+        model="m",
+        timeout_seconds=1.0,
+        event_callback=callback,
+        clock=clock,
+        progress_interval_seconds=10.0,
+    )
+    monitor.begin_attempt()
+    monitor.record_progress(4)
+    assert monitor.bytes_received == 4
+    clock.now = 11.0
+    try:
+        monitor.check_deadline()
+    except ProviderRequestStalledError:
+        pass
+    else:
+        raise AssertionError("deadline did not raise")
+
+    assert [name for name, _ in seen] == [
+        "provider_request.started",
+        "provider_request.failed",
+    ]
+    assert set(seen[-1][1]) == {
+        "provider",
+        "model",
+        "api_request_id",
+        "retry_count",
+        "elapsed_seconds",
+        "timeout_seconds",
+        "bytes_received",
+        "error_code",
+    }
