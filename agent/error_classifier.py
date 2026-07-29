@@ -16,6 +16,8 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
+from agent.provider_request_watchdog import ProviderRequestStalledError
+
 logger = logging.getLogger(__name__)
 
 
@@ -688,6 +690,18 @@ def classify_api_error(
         }
         defaults.update(overrides)
         return ClassifiedError(**defaults)
+
+    # An absolute provider-request deadline is a transport timeout even though
+    # it subclasses TimeoutError. Keep this explicit and ahead of generic
+    # heuristics so later message changes cannot redirect it into compression
+    # or credential rotation.
+    if isinstance(error, ProviderRequestStalledError):
+        return _result(
+            FailoverReason.timeout,
+            retryable=True,
+            should_compress=False,
+            should_rotate_credential=False,
+        )
 
     # ── 1. Provider-specific patterns (highest priority) ────────────
 

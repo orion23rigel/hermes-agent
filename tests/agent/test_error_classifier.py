@@ -10,6 +10,7 @@ from agent.error_classifier import (
     _extract_error_code,
     _classify_402,
 )
+from agent.provider_request_watchdog import ProviderRequestStalledError
 
 
 # ── Helper: mock API errors ────────────────────────────────────────────
@@ -2327,3 +2328,49 @@ class TestExpandedOverflowPatterns:
         assert result.reason == FailoverReason.context_overflow
 
 
+class TestProviderRequestStalledError:
+    def test_provider_request_stalled_error_is_a_retryable_transport_timeout(self):
+        error = ProviderRequestStalledError(
+            provider="openrouter",
+            model="anthropic/claude-sonnet-4",
+            timeout_seconds=30.0,
+            elapsed_seconds=30.125,
+            api_request_id="req_123",
+            retry_count=2,
+            bytes_received=4096,
+        )
+
+        result = classify_api_error(error, provider=error.provider, model=error.model)
+
+        assert result.reason == FailoverReason.timeout
+        assert result.retryable is True
+        assert result.should_compress is False
+        assert result.should_rotate_credential is False
+
+    def test_stall_branch_runs_before_message_heuristics(self):
+        # The explicit branch exists so a subclass or a reworded diagnostic
+        # cannot be rerouted into compression or credential rotation by the
+        # generic message patterns. Both of these strings classify as
+        # context_overflow / billing on any other exception type.
+        class _StalledSubclass(ProviderRequestStalledError):
+            def __init__(self, message: str) -> None:
+                super().__init__(
+                    provider="openrouter",
+                    model="m",
+                    timeout_seconds=30.0,
+                    elapsed_seconds=30.5,
+                )
+                self.args = (message,)
+
+        for message in (
+            "This model's maximum context length is 200000 tokens",
+            "insufficient credits",
+        ):
+            result = classify_api_error(
+                _StalledSubclass(message), provider="openrouter", model="m"
+            )
+
+            assert result.reason == FailoverReason.timeout
+            assert result.retryable is True
+            assert result.should_compress is False
+            assert result.should_rotate_credential is False
