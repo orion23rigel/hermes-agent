@@ -412,3 +412,108 @@ def test_single_query_exit_code_is_scoped_to_kanban_workers(
     assert cli_mod._single_query_exit_code(
         result, kanban_worker=kanban_worker
     ) == expected
+
+
+def test_goal_mode_initial_provider_stall_skips_goal_loop_and_exits_74(
+    monkeypatch,
+):
+    import cli as cli_mod
+
+    stalled = {
+        "final_response": "",
+        "failed": True,
+        "error": "provider request stalled",
+        "error_code": "provider_request_stalled",
+        "retryable": True,
+    }
+
+    class FakeCLI:
+        def __init__(self, **_kwargs):
+            self.provider = "test-provider"
+            self.model = "test-model"
+            self.session_id = "goal-stall"
+            self.conversation_history = []
+            self._active_agent_route_signature = "same-route"
+            self.agent = SimpleNamespace(
+                session_id="goal-stall",
+                platform="cli",
+                quiet_mode=False,
+                suppress_status_output=False,
+                stream_delta_callback=object(),
+                tool_gen_callback=object(),
+                run_conversation=lambda **_kwargs: stalled,
+            )
+
+        def _claim_active_session(self, _surface, *, stderr=False):
+            return True
+
+        def _ensure_runtime_credentials(self):
+            return True
+
+        def _resolve_turn_agent_config(self, _query):
+            return {
+                "signature": "same-route",
+                "model": None,
+                "runtime": None,
+                "request_overrides": None,
+            }
+
+        def _init_agent(self, **_kwargs):
+            return True
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_goal_stall")
+    monkeypatch.setenv("HERMES_KANBAN_GOAL_MODE", "1")
+    monkeypatch.setattr(cli_mod, "HermesCLI", FakeCLI)
+    monkeypatch.setattr(cli_mod.atexit, "register", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(cli_mod, "_finalize_single_query", lambda _cli: None)
+    monkeypatch.setattr(
+        cli_mod,
+        "_run_kanban_goal_loop_q",
+        lambda *_args, **_kwargs: pytest.fail("goal loop must not run"),
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli_mod.main(query="hello", quiet=True, toolsets="terminal")
+
+    assert exc_info.value.code == 74
+
+
+def test_goal_mode_later_provider_stall_is_returned_promptly(
+    monkeypatch, tmp_path,
+):
+    import cli as cli_mod
+    from hermes_cli import goals
+    from hermes_cli import kanban_db as kb
+
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "kanban.db"))
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="goal stall",
+            body="finish safely",
+            assignee="engineer",
+            goal_mode=True,
+        )
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+
+    stalled = {
+        "final_response": "",
+        "failed": True,
+        "error_code": "provider_request_stalled",
+        "retryable": True,
+    }
+    fake_cli = SimpleNamespace(
+        session_id="goal-session",
+        conversation_history=[],
+        agent=SimpleNamespace(
+            session_id="goal-session",
+            run_conversation=lambda **_kwargs: stalled,
+        ),
+    )
+
+    def run_one_more_turn(**kwargs):
+        kwargs["run_turn"]("continue")
+
+    monkeypatch.setattr(goals, "run_kanban_goal_loop", run_one_more_turn)
+
+    assert cli_mod._run_kanban_goal_loop_q(fake_cli, "first") is stalled

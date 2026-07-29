@@ -17114,7 +17114,7 @@ def _kanban_worker_terminal_exit_code(default_code: int) -> int:
         return protocol_failure_code
 
 
-def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
+def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> object:
     """Drive a kanban goal_mode worker through the Ralph-style goal loop.
 
     Called from the quiet single-query path AFTER the worker's first turn,
@@ -17154,8 +17154,13 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
         return
 
     max_turns = task.goal_max_turns or _DEF_TURNS
+    failed_result: object = None
+
+    class _GoalLoopProviderFailure(Exception):
+        pass
 
     def _run_turn(prompt: str) -> str:
+        nonlocal failed_result
         result = cli.agent.run_conversation(
             user_message=prompt,
             conversation_history=cli.conversation_history,
@@ -17169,6 +17174,9 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
         resp = result.get("final_response", "") if isinstance(result, dict) else str(result)
         if resp:
             print(resp)
+        if isinstance(result, dict) and result.get("failed"):
+            failed_result = result
+            raise _GoalLoopProviderFailure
         return resp or ""
 
     def _task_status() -> "str | None":
@@ -17192,16 +17200,20 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
             except Exception:
                 pass
 
-    _run_loop(
-        task_id=task_id,
-        goal_text=goal_text,
-        run_turn=_run_turn,
-        task_status_fn=_task_status,
-        block_fn=_block,
-        max_turns=max_turns,
-        first_response=first_response or "",
-        log=lambda m: logger.info("%s", m),
-    )
+    try:
+        _run_loop(
+            task_id=task_id,
+            goal_text=goal_text,
+            run_turn=_run_turn,
+            task_status_fn=_task_status,
+            block_fn=_block,
+            max_turns=max_turns,
+            first_response=first_response or "",
+            log=lambda m: logger.info("%s", m),
+        )
+    except _GoalLoopProviderFailure:
+        return failed_result
+    return None
 
 
 def main(
@@ -17667,9 +17679,17 @@ def main(
                         # out (→ sticky block). Gated on the env vars the
                         # dispatcher sets in `_default_spawn`; a no-op for every
                         # normal worker and every non-kanban `-q` run.
-                        if os.environ.get("HERMES_KANBAN_GOAL_MODE") == "1":
+                        if (
+                            os.environ.get("HERMES_KANBAN_GOAL_MODE") == "1"
+                            and not (
+                                isinstance(result, dict)
+                                and result.get("failed")
+                            )
+                        ):
                             try:
-                                _run_kanban_goal_loop_q(cli, response)
+                                _goal_result = _run_kanban_goal_loop_q(cli, response)
+                                if isinstance(_goal_result, dict):
+                                    result = _goal_result
                             except Exception as _goal_exc:
                                 logger.debug("kanban goal loop failed: %s", _goal_exc)
 
