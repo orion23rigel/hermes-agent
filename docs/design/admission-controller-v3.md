@@ -55,7 +55,6 @@ PRAGMA busy_timeout = 250;        -- match poll interval; see §3.1
 
 CREATE TABLE IF NOT EXISTS requests (
     id                TEXT PRIMARY KEY,                       -- UUID
-    rowid             INTEGER NOT NULL,                       -- SQLite autoincrement (use as monotonic seq)
     lane              TEXT NOT NULL,                          -- 'interactive' | 'background'
     source            TEXT NOT NULL,                          -- 'gateway' | 'cli' | 'cron' | 'kanban' | 'delegation' | 'auxiliary'
     state             TEXT NOT NULL DEFAULT 'queued',          -- queued | running | done | cancelled | expired | abandoned
@@ -85,6 +84,7 @@ CREATE TABLE IF NOT EXISTS endpoints (
     max_queue_age               REAL NOT NULL DEFAULT 120.0,
     circuit_breaker_threshold   INTEGER NOT NULL DEFAULT 5,
     circuit_breaker_cooldown    REAL NOT NULL DEFAULT 300.0,
+    consecutive_interactive     INTEGER NOT NULL DEFAULT 0,
     consecutive_timeout_count   INTEGER NOT NULL DEFAULT 0,
     blocked_until_ms            INTEGER
 );
