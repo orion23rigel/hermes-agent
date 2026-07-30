@@ -7,9 +7,13 @@ It does NOT own: client construction, streaming, credential refresh,
 prompt caching, interrupt handling, or retry logic.  Those stay on AIAgent.
 """
 
+from __future__ import annotations
+
+import threading
 from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Optional
 
+from agent.admission_controller import AdmissionToken
 from agent.transports.types import NormalizedResponse
 
 
@@ -87,3 +91,33 @@ class ProviderTransport(ABC):
         with different stop reason vocabularies.
         """
         return raw_reason
+
+    # ── Admission lifecycle hooks ───────────────────────────────────────
+
+    def admit(
+        self,
+        endpoint_hash: str,
+        lane: str,
+        source: str,
+        admission_timeout: float | None = None,
+        cancel_event: threading.Event | None = None,
+    ) -> AdmissionToken:
+        """Block until capacity granted or admission_timeout expires.
+
+        Default: no-op, returns immediately (admission disabled).
+        Transport subclasses that support admission control override this
+        to call the AdmissionController.
+
+        Returns:
+            AdmissionToken on success.  A no-op token (lock_fd=None) when
+            admission is disabled or unavailable.
+        """
+        return AdmissionToken(request_id="", endpoint_hash="", lock_fd=None)
+
+    def release(self, token: AdmissionToken) -> None:
+        """Release the slot. Idempotent.
+
+        Default: no-op.  Transport subclasses that support admission
+        control override this to call the AdmissionController.release().
+        """
+        pass

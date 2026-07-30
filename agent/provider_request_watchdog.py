@@ -8,6 +8,8 @@ import time
 from collections.abc import Callable
 from typing import Any
 
+from agent.admission_controller import AdmissionToken
+
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +69,8 @@ class ProviderRequestMonitor:
         event_callback: Callable[[str, dict[str, Any]], None] | None = None,
         clock: Callable[[], float] = time.monotonic,
         progress_interval_seconds: float = 5.0,
+        admission_token: AdmissionToken | None = None,
+        release_fn: Callable[[AdmissionToken], None] | None = None,
     ) -> None:
         if timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be positive")
@@ -85,6 +89,9 @@ class ProviderRequestMonitor:
         self._bytes_received = 0
         self._terminal = False
         self._terminal_kind: str | None = None
+        # Admission token lifecycle
+        self._admission_token = admission_token
+        self._release_fn = release_fn
 
     @property
     def deadline(self) -> float | None:
@@ -191,6 +198,7 @@ class ProviderRequestMonitor:
                 self._terminal_kind = "completed"
                 payload = self._payload_locked(now)
                 event = "provider_request.completed"
+        self._release_admission()
         self._emit(event, payload)
         if stall_error is not None:
             raise stall_error
@@ -212,6 +220,7 @@ class ProviderRequestMonitor:
                 stall_error = self._stall_error_locked(now)
                 error_code = stall_error.error_code
             payload = self._payload_locked(now, error_code=error_code)
+        self._release_admission()
         self._emit("provider_request.failed", payload)
         if stall_error is not None:
             raise stall_error
@@ -229,6 +238,7 @@ class ProviderRequestMonitor:
             self._terminal = True
             self._terminal_kind = "cancelled"
             payload = self._payload_locked(now, error_code=error_code)
+        self._release_admission()
         self._emit("provider_request.failed", payload)
         return True
 
@@ -270,3 +280,20 @@ class ProviderRequestMonitor:
             callback(event, payload)
         except Exception:
             logger.debug("Provider request lifecycle callback failed", exc_info=True)
+
+    # ── Admission token lifecycle ───────────────────────────────────────────
+
+    def _release_admission(self) -> None:
+        """Release the admission token if one was provided.
+
+        Called from all terminal paths (complete, fail, cancel) to ensure
+        the admission slot is freed exactly once.
+        """
+        token = self._admission_token
+        release_fn = self._release_fn
+        if token is not None and release_fn is not None:
+            self._admission_token = None  # Prevent double-release
+            try:
+                release_fn(token)
+            except Exception:
+                logger.debug("Admission token release failed", exc_info=True)

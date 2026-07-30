@@ -9,8 +9,16 @@ which has provider-specific conditionals for max_tokens defaults,
 reasoning configuration, temperature handling, and extra_body assembly.
 """
 
+from __future__ import annotations
+
+import threading
 from typing import Any, Dict
 
+from agent.admission_controller import (
+    AdmissionController,
+    AdmissionToken,
+    endpoint_hash as _endpoint_hash,
+)
 from agent.lmstudio_reasoning import resolve_lmstudio_effort
 from agent.moonshot_schema import is_moonshot_model, sanitize_moonshot_tools
 from agent.prompt_builder import DEVELOPER_ROLE_MODELS
@@ -133,6 +141,50 @@ class ChatCompletionsTransport(ProviderTransport):
 
     The default path for OpenAI-compatible providers.
     """
+
+    def __init__(self) -> None:
+        self._admission_controller: AdmissionController | None = None
+        self._admission_config: dict[str, Any] = {}
+
+    # ── Admission control ───────────────────────────────────────────────
+
+    def set_admission_controller(
+        self,
+        controller: AdmissionController | None,
+        config: dict[str, Any] | None = None,
+    ) -> None:
+        """Wire in an admission controller for this transport instance."""
+        self._admission_controller = controller
+        self._admission_config = dict(config or {})
+
+    def admit(
+        self,
+        endpoint_hash: str,
+        lane: str,
+        source: str,
+        admission_timeout: float | None = None,
+        cancel_event: threading.Event | None = None,
+    ) -> AdmissionToken:
+        """Override: use AdmissionController if configured."""
+        ctrl = self._admission_controller
+        if ctrl is not None and endpoint_hash:
+            return ctrl.acquire(
+                endpoint_hash=endpoint_hash,
+                lane=lane,
+                source=source,
+                admission_timeout=admission_timeout,
+                cancel_event=cancel_event,
+            ) or AdmissionToken(request_id="", endpoint_hash="", lock_fd=None)
+        # No-op when no controller is wired
+        return AdmissionToken(request_id="", endpoint_hash="", lock_fd=None)
+
+    def release(self, token: AdmissionToken) -> None:
+        """Override: use AdmissionController if configured."""
+        ctrl = self._admission_controller
+        if ctrl is not None and token is not None and token.lock_fd is not None:
+            ctrl.release(token)
+
+    # ── Properties ──────────────────────────────────────────────────────
 
     @property
     def api_mode(self) -> str:

@@ -932,7 +932,22 @@ def _ensure_hermes_home_managed(home: Path):
 
 DEFAULT_CONFIG = {
     "model": "",
-    "providers": {},
+    "providers": {
+        # Per-provider settings.  Each key is a provider name (e.g. "openrouter",
+        # "custom", or your own label).  Admission control can be configured
+        # per endpoint under the ``admission`` key:
+        #
+        # providers:
+        #   my-endpoint:
+        #     base_url: https://...
+        #     api_key: ...
+        #     admission:
+        #       enabled: False         # default: opt-in per endpoint
+        #       max_slots: 1
+        #       admission_timeout: 30.0
+        #       interactive_burst: 3
+        #       max_queue_age: 120
+    },
     "fallback_providers": [],
     "credential_pool_strategies": {},
     "toolsets": ["hermes-cli"],
@@ -5418,6 +5433,8 @@ def _normalize_custom_provider_entry(
         "request_timeout_seconds", "stale_timeout_seconds",
         "discover_models", "extra_body", "extra_headers",
         "ssl_ca_cert", "ssl_verify",
+        # Admission control (Wave 1+)
+        "admission",
     }
     for camel, snake in _CAMEL_ALIASES.items():
         if camel in entry and snake not in entry:
