@@ -48,6 +48,10 @@ from hermes_cli.config import (
 )
 from hermes_cli.fallback_config import get_fallback_chain
 from hermes_time import now as _hermes_now
+from agent.admission_controller import (
+    get_shared_controller,
+    resolve_background_endpoint_hash,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -3877,6 +3881,42 @@ def _teardown_cron_agent(agent, job_id: str) -> None:
         logger.debug("Job '%s': failed to reap stale auxiliary clients: %s", job_id, e)
 
 
+def _admit_cron_or_defer(job: dict) -> None:
+    """Pre-flight admission check for a cron job run.
+
+    If the provider endpoint is saturated, logs a deferral and raises
+    _CronAdmissionDeferred so the caller skips the job this tick.
+    """
+    endpoint = resolve_background_endpoint_hash()
+    if endpoint is None:
+        return
+    ctrl = get_shared_controller()
+    if not ctrl.is_admitted(endpoint):
+        return
+    token = ctrl.acquire(
+        endpoint_hash=endpoint,
+        lane="background",
+        source="cron",
+        admission_timeout=5.0,
+        cancel_event=None,
+    )
+    if token is None:
+        job_id = job.get("id", "?")
+        logger.info(
+            "Cron job '%s': admission timeout for endpoint %s — deferring tick",
+            job_id, endpoint,
+        )
+        raise _CronAdmissionDeferred(job_id, endpoint)
+    ctrl.release(token)
+
+
+class _CronAdmissionDeferred(Exception):
+    """Raised when a cron job is deferred due to admission timeout."""
+
+    def __init__(self, job_id: str, endpoint: str):
+        super().__init__(f"admission:timeout for cron job {job_id} on endpoint {endpoint}")
+
+
 def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -> bool:
     """Run ONE due job end-to-end: execute → save output → deliver → mark.
 
@@ -3943,6 +3983,22 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
         # below once delivery is done. Defense-in-depth alongside the
         # interpreter-shutdown guard in _deliver_result.
         _deferred_agents: list = []
+
+        # Pre-flight admission check — defer the cron tick when the
+        # provider endpoint is saturated.
+        try:
+            _admit_cron_or_defer(job)
+        except _CronAdmissionDeferred:
+            # Admission deferral is an intentional skip — record it as
+            # processed (not a crash or failure) and return cleanly.
+            logger.info("Cron job '%s': deferred due to admission timeout", job.get("name", job["id"]))
+            finish_execution(
+                execution_id,
+                success=False,
+                error="admission:timeout",
+            )
+            return True
+
         try:
             success, output, final_response, error = run_job(
                 job, defer_agent_teardown=_deferred_agents

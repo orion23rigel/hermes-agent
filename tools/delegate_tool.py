@@ -35,6 +35,12 @@ from urllib.parse import urlsplit, urlunsplit
 
 from toolsets import TOOLSETS
 
+# Admission control for delegated subagents
+from agent.admission_controller import (
+    get_shared_controller,
+    resolve_background_endpoint_hash,
+)
+
 # Sentinel value used by the runtime provider system for providers that are
 # not natively known (named custom providers, third-party aggregators, etc.).
 # Must match hermes_cli.runtime_provider.RUNTIME_PROVIDER_TYPE_CUSTOM.
@@ -2776,6 +2782,49 @@ def _recover_tasks_from_json_string(
     return parsed, None
 
 
+def _admit_delegate_or_busy() -> dict | None:
+    """Pre-flight admission check for delegated subagents.
+
+    Returns a "resource busy" result dict when admission is denied (timeout),
+    or None when capacity is available (proceed with dispatch).
+    """
+    endpoint = resolve_background_endpoint_hash()
+    if endpoint is None:
+        return None
+    ctrl = get_shared_controller()
+    if not ctrl.is_admitted(endpoint):
+        return None
+    token = ctrl.acquire(
+        endpoint_hash=endpoint,
+        lane="background",
+        source="delegation",
+        admission_timeout=5.0,
+        cancel_event=None,
+    )
+    if token is None:
+        logger.warning(
+            "Delegation: admission timeout for endpoint %s — returning resource busy",
+            endpoint,
+        )
+        return {
+            "results": [
+                {
+                    "task_index": 0,
+                    "status": "error",
+                    "summary": None,
+                    "error": "Resource busy: provider endpoint is saturated. "
+                             "Retry when capacity is available, or increase "
+                             "admission_timeout in the provider config.",
+                    "api_calls": 0,
+                    "duration_seconds": 0,
+                }
+            ],
+            "total_duration_seconds": 0,
+        }
+    ctrl.release(token)
+    return None
+
+
 def delegate_task(
     goal: Optional[str] = None,
     context: Optional[str] = None,
@@ -2989,6 +3038,12 @@ def delegate_task(
         results block. That is the contract: fan-out runs in the background,
         waits on each other, and returns together.
         """
+        # Pre-flight admission check — return "resource busy" when the
+        # provider endpoint is saturated.
+        _busy = _admit_delegate_or_busy()
+        if _busy is not None:
+            return _busy
+
         if n_tasks == 1:
             # Single task -- run directly (no thread pool overhead)
             _i, _t, child = children[0]

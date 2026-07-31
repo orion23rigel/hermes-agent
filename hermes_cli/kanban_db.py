@@ -92,6 +92,13 @@ from typing import Any, Iterable, Mapping, Optional
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from toolsets import get_toolset_names
 
+# Admission control for background workers
+from agent.admission_controller import (
+    AdmissionTimeoutError,
+    get_shared_controller,
+    resolve_background_endpoint_hash,
+)
+
 _log = logging.getLogger(__name__)
 
 
@@ -9470,6 +9477,21 @@ def _dispatch_once_locked(
                 _per_profile_running[claimed.assignee] = (
                     _per_profile_running.get(claimed.assignee, 0) + 1
                 )
+        except AdmissionTimeoutError as exc:
+            # Admission timeout: block the task immediately without
+            # consuming a spawn failure — the endpoint is saturated,
+            # not broken.
+            _log.warning(
+                "Blocking kanban task %s due to admission timeout: %s",
+                claimed.id, exc,
+            )
+            block_task(
+                conn, claimed.id,
+                reason=str(exc),
+                kind="transient",
+                expected_run_id=claimed.current_run_id,
+            )
+            result.auto_blocked.append(claimed.id)
         except Exception as exc:
             if isinstance(
                 exc, (WorkspaceValidationError, WorktreeProvenanceError)
@@ -9846,6 +9868,44 @@ def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[st
         return None
 
 
+def _admit_worker_or_raise(task: Task, *, board: Optional[str] = None) -> None:
+    """Pre-flight admission check before spawning a kanban worker.
+
+    If admission is enabled for the configured provider endpoint and the
+    slot is saturated (queue full / timeout), raises AdmissionTimeoutError
+    so the caller can block the task without burning a subprocess.
+    """
+    endpoint = resolve_background_endpoint_hash()
+    if endpoint is None:
+        # No configured provider — admission is a no-op
+        return
+    ctrl = get_shared_controller()
+    is_admitted = ctrl.is_admitted(endpoint)
+    if not is_admitted:
+        # Admission not enabled for this endpoint — no-op
+        return
+    # Try with a short timeout for background pre-flight
+    token = ctrl.acquire(
+        endpoint_hash=endpoint,
+        lane="background",
+        source="kanban",
+        admission_timeout=5.0,
+        cancel_event=None,
+    )
+    if token is None:
+        _log.warning(
+            "Kanban task %s: admission timeout for endpoint %s — blocking",
+            task.id, endpoint,
+        )
+        raise AdmissionTimeoutError(f"admission:timeout for endpoint {endpoint}")
+    # Token acquired — will be released by the worker subprocess's provider
+    # call lifecycle.  Kanban workers are fire-and-forget subprocesses; the
+    # token's lock_fd is intentionally NOT inherited by the child (O_CLOEXEC),
+    # so release is a no-op here.  The token serves only as a gate check:
+    # if admission is saturated we don't spawn the subprocess at all.
+    ctrl.release(token)
+
+
 def _default_spawn(
     task: Task,
     workspace: str,
@@ -10044,6 +10104,10 @@ def _default_spawn(
     log_path = log_dir / f"{task.id}.log"
     rotate_bytes, backup_count = worker_log_rotation_config()
     _rotate_worker_log(log_path, rotate_bytes, backup_count)
+
+    # Pre-flight admission check — don't burn a subprocess + provider
+    # timeout when the endpoint is saturated.
+    _admit_worker_or_raise(task, board=board)
 
     # Use 'a' so a re-run on unblock appends rather than overwrites.
     log_f = open(log_path, "ab")

@@ -154,6 +154,50 @@ INTERACTIVE = "interactive"
 BACKGROUND = "background"
 
 
+# ── Shared controller singleton ──────────────────────────────────────────────
+
+_shared_controller: AdmissionController | None = None
+_shared_controller_lock = threading.Lock()
+
+
+def get_shared_controller() -> AdmissionController:
+    """Return the process-wide shared AdmissionController singleton.
+
+    Lazily initialized on first call with the default hermes_home and no
+    per-endpoint config (admission is opt-in via config.yaml providers.<name>.admission.enabled).
+    """
+    global _shared_controller
+    if _shared_controller is None:
+        with _shared_controller_lock:
+            if _shared_controller is None:
+                _shared_controller = AdmissionController()
+    return _shared_controller
+
+
+def resolve_background_endpoint_hash() -> str | None:
+    """Resolve an endpoint hash from the first configured provider base_url.
+
+    Background callers (kanban, cron, delegation, gateway) don't have a single
+    provider URL at dispatch time; we use the first provider base_url found in
+    the active config as a proxy for "the LLM endpoint this background caller
+    will hit." When no provider has a base_url, returns None (admission is a
+    no-op).
+    """
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config()
+        providers = cfg.get("providers", {})
+        for _name, entry in providers.items():
+            if isinstance(entry, dict):
+                base_url = (entry.get("base_url") or "").strip()
+                if base_url:
+                    return endpoint_hash(base_url)
+    except Exception:
+        pass
+    return None
+
+
 # ── Boot identity helpers ────────────────────────────────────────────────────
 
 

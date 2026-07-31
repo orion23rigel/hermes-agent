@@ -55,6 +55,11 @@ from typing import Awaitable, Callable, Dict, Optional, Any, List, Union, cast
 # preserving the established test-patch surface.
 from agent.account_usage import fetch_account_usage, render_account_usage_lines
 from agent.async_utils import consume_detached_task_result, safe_schedule_threadsafe
+from agent.admission_controller import (
+    get_shared_controller,
+    resolve_background_endpoint_hash,
+    classify_lane,
+)
 from agent.conversation_compression import (
     COMPACTION_STATUS,
     COMPRESSION_RETRY_CONTEXT_REDUCED_STATUS_TEMPLATE,
@@ -3334,6 +3339,45 @@ _RECONNECT_BACKOFF_CAP = 300
 def _reconnect_backoff(attempt: int) -> int:
     """Exponential reconnect backoff: 30s, 60s, 120s, ... capped at 5 min."""
     return min(30 * (2 ** (attempt - 1)), _RECONNECT_BACKOFF_CAP)
+
+
+def _admit_gateway_or_queue(agent: Any, message: str) -> str | None:
+    """Pre-flight admission check for interactive gateway agent runs.
+
+    Interactive sessions use lane='interactive' so they get priority over
+    background callers (kanban, cron, delegation).
+
+    Returns None when admission was granted (proceed with dispatch).
+    Returns a user-facing "queued" message string when timeout expires
+    — the caller should return this message instead of calling
+    ``run_conversation``.
+    """
+    endpoint = resolve_background_endpoint_hash()
+    if endpoint is None:
+        return None
+    ctrl = get_shared_controller()
+    lane = classify_lane("gateway", is_interactive=True)  # "interactive"
+    if not ctrl.is_admitted(endpoint):
+        return None
+    token = ctrl.acquire(
+        endpoint_hash=endpoint,
+        lane=lane,
+        source="gateway",
+        admission_timeout=5.0,
+        cancel_event=None,
+    )
+    if token is None:
+        logger.warning(
+            "Gateway: admission timeout for endpoint %s — queuing message",
+            endpoint,
+        )
+        return (
+            "⚠ The inference slot is busy — your message is queued. "
+            "Please wait and try again, or increase the provider's "
+            "admission.max_slots setting."
+        )
+    ctrl.release(token)
+    return None
 
 
 class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, GatewaySlashCommandsMixin):
@@ -22916,6 +22960,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _conversation_kwargs["moa_config"] = moa_config
                 if _persist_user_timestamp_override is not None:
                     _conversation_kwargs["persist_user_timestamp"] = _persist_user_timestamp_override
+
+                # Pre-flight admission check — for interactive gateway sessions
+                # the lane is 'interactive' (NOT 'background'), so interactive
+                # users get priority over background callers.
+                _admit_message = _admit_gateway_or_queue(agent, message)
+                if _admit_message is not None:
+                    result = {
+                        "final_response": _admit_message,
+                        "response_metadata": {},
+                    }
+                    result_holder[0] = result
+                    break
+
                 result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
             finally:
                 unregister_gateway_notify(_approval_session_key)
