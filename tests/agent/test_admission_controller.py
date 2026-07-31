@@ -809,6 +809,54 @@ class TestProviderRequestMonitorAdmission:
             mon.complete()
         # No exception = success
 
+    def test_stall_releases_capacity_for_next_acquire(self, controller: AdmissionController):
+        """A monitor deadline stall must return the endpoint's admission slot.
+
+        Regression for the token-leak finding: after check_deadline()
+        terminalized, the flock stayed held and the SQLite row stayed
+        'running', so every subsequent acquire on the endpoint timed out.
+        """
+        from agent.provider_request_watchdog import (
+            ProviderRequestMonitor,
+            ProviderRequestStalledError,
+        )
+
+        class _Clock:
+            def __init__(self) -> None:
+                self.now = 100.0
+
+            def __call__(self) -> float:
+                return self.now
+
+        ehash = _test_endpoint_hash()
+        token = controller.acquire(ehash, "interactive", "test", admission_timeout=2.0)
+        assert token is not None and token.lock_fd is not None
+        assert controller.status(ehash)["running"] == 1
+
+        clock = _Clock()
+        mon = ProviderRequestMonitor(
+            provider="test", model="test", timeout_seconds=5.0,
+            clock=clock,
+            admission_token=token,
+            release_fn=controller.release,
+        )
+        mon.begin_attempt()
+        clock.now += 6
+
+        with pytest.raises(ProviderRequestStalledError):
+            mon.check_deadline()
+
+        # The slot must be returned: status back to 0, and a fresh acquire
+        # on the same endpoint succeeds promptly instead of timing out.
+        assert controller.status(ehash)["running"] == 0
+        start = time.monotonic()
+        token2 = controller.acquire(ehash, "interactive", "test", admission_timeout=1.0)
+        elapsed = time.monotonic() - start
+        assert token2 is not None, "capacity was not returned after monitor stall"
+        assert token2.lock_fd is not None
+        assert elapsed < 1.0, f"acquire blocked too long: {elapsed:.3f}s"
+        controller.release(token2)
+
 
 # ---------------------------------------------------------------------------
 # ChatCompletionsTransport admit/release integration

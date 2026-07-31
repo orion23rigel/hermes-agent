@@ -155,6 +155,8 @@ class ProviderRequestMonitor:
                 if last is None or now - last >= self._progress_interval_seconds:
                     self._last_progress_event_at = now
                     payload = self._payload_locked(now)
+        if stall_error is not None:
+            self._release_admission()
         if payload is not None:
             self._emit(event, payload)
         if stall_error is not None:
@@ -176,6 +178,7 @@ class ProviderRequestMonitor:
             self._terminal = True
             self._terminal_kind = "failed"
             payload = self._payload_locked(now, error_code=PROVIDER_REQUEST_STALLED)
+        self._release_admission()
         self._emit("provider_request.failed", payload)
         raise error
 

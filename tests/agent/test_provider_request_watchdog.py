@@ -282,3 +282,84 @@ def test_progress_arriving_after_deadline_is_rejected_terminally():
     assert events[-1][0] == "provider_request.failed"
     assert events[-1][1]["bytes_received"] == 3
     assert monitor.complete() is False
+
+
+def test_check_deadline_stall_releases_admission_exactly_once():
+    """A deadline terminalization must release the admission token.
+
+    Regression for the token-leak finding: check_deadline() sets
+    _terminal=True but never released, and later complete/fail/cancel
+    return False early — so the first terminalization leaked the slot.
+    """
+    from agent.admission_controller import AdmissionToken
+
+    clock = _Clock()
+    release_calls = []
+    monitor = ProviderRequestMonitor(
+        provider="p",
+        model="m",
+        timeout_seconds=5.0,
+        clock=clock,
+        admission_token=AdmissionToken(request_id="r1", endpoint_hash="h1", lock_fd=5),
+        release_fn=lambda token: release_calls.append(token),
+    )
+    monitor.begin_attempt()
+    clock.now += 6
+
+    with pytest.raises(ProviderRequestStalledError):
+        monitor.check_deadline()
+
+    assert [t.request_id for t in release_calls] == ["r1"]
+    assert monitor.terminal is True
+    # Later terminal transitions on the same monitor must not double-release.
+    assert monitor.complete() is False
+    assert monitor.fail(RuntimeError("late")) is False
+    assert monitor.cancel(InterruptedError("stop")) is False
+    assert [t.request_id for t in release_calls] == ["r1"]
+
+
+def test_record_progress_stall_releases_admission_exactly_once():
+    """The record_progress() stall branch must also release the token."""
+    from agent.admission_controller import AdmissionToken
+
+    clock = _Clock()
+    release_calls = []
+    monitor = ProviderRequestMonitor(
+        provider="p",
+        model="m",
+        timeout_seconds=5.0,
+        clock=clock,
+        admission_token=AdmissionToken(request_id="r2", endpoint_hash="h1", lock_fd=5),
+        release_fn=lambda token: release_calls.append(token),
+    )
+    monitor.begin_attempt()
+    clock.now += 6
+
+    with pytest.raises(ProviderRequestStalledError):
+        monitor.record_progress(7)
+
+    assert [t.request_id for t in release_calls] == ["r2"]
+    assert monitor.terminal is True
+    # A later complete/fail cannot double-release an already-released token.
+    assert monitor.complete() is False
+    assert monitor.fail(RuntimeError("late")) is False
+    assert [t.request_id for t in release_calls] == ["r2"]
+
+
+def test_no_admission_release_without_token_on_stall():
+    """Stall terminalization without a token/release_fn stays a no-op."""
+    clock = _Clock()
+    monitor = ProviderRequestMonitor(
+        provider="p",
+        model="m",
+        timeout_seconds=5.0,
+        clock=clock,
+        admission_token=None,
+        release_fn=None,
+    )
+    monitor.begin_attempt()
+    clock.now += 6
+
+    with pytest.raises(ProviderRequestStalledError):
+        monitor.check_deadline()
+    # No exception from the release path = success
