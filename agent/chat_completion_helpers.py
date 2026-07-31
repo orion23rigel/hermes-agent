@@ -58,6 +58,69 @@ _OPENROUTER_PROVIDER_SORT_VALUES = {"throughput", "latency", "price"}
 _FALLBACK_EXHAUSTED_COOLDOWN_S = 5.0
 
 
+# ── Admission control helper ───────────────────────────────────────────────
+# Wires ChatCompletionsTransport.admit()/release() into the provider call
+# paths.  When admission is disabled (default), the token is a no-op and
+# the monitor's _release_admission is a no-op.
+def _acquire_admission_token(agent) -> tuple:
+    """Call transport.admit() and return (token, release_fn) for the monitor.
+
+    The release_fn is a bound method on the transport that releases the token.
+    When admission is disabled the token is a no-op (lock_fd=None).
+    """
+    transport = None
+    try:
+        transport = agent._get_transport()
+    except Exception:
+        pass
+    if transport is None:
+        from agent.admission_controller import AdmissionToken
+
+        return (
+            AdmissionToken(request_id="", endpoint_hash="", lock_fd=None),
+            None,
+        )
+    # Build endpoint hash from the agent's base_url
+    try:
+        from agent.admission_controller import endpoint_hash
+
+        base_url = getattr(agent, "base_url", "") or ""
+        ep_hash = endpoint_hash(base_url) if base_url else ""
+    except Exception:
+        ep_hash = ""
+    # Classify lane: interactive if platform is cli/TUI, background otherwise
+    try:
+        from agent.admission_controller import classify_lane
+
+        platform = getattr(agent, "platform", "") or ""
+        is_interactive = platform in {"cli", "tui", "desktop"}
+        lane = classify_lane(platform, is_interactive)
+    except Exception:
+        lane = "background"
+    source = str(getattr(agent, "platform", "") or "unknown")
+    # Call admit() — blocks until capacity or timeout
+    try:
+        admission_timeout = _env_float("HERMES_ADMISSION_TIMEOUT", 30.0)
+        token = transport.admit(
+            endpoint_hash=ep_hash,
+            lane=lane,
+            source=source,
+            admission_timeout=admission_timeout,
+        )
+        # Bind release_fn to this transport instance
+        release_fn = (
+            token.lock_fd is not None and getattr(transport, "release", None)
+        )
+        return token, release_fn or None
+    except Exception:
+        from agent.admission_controller import AdmissionToken
+
+        return (
+            AdmissionToken(request_id="", endpoint_hash="", lock_fd=None),
+            None,
+        )
+
+
 def _context_thread_target(callback):
     """Bind a no-argument thread target to the caller's ContextVars."""
     context = contextvars.copy_context()
@@ -536,11 +599,16 @@ def direct_api_call(agent, api_kwargs: dict):
         ProviderRequestStalledError,
     )
 
+    # ── Admission control ─────────────────────────────────────────────
+    admission_token, release_fn = _acquire_admission_token(agent)
+
     request_monitor = ProviderRequestMonitor(
         provider=str(getattr(agent, "provider", "") or ""),
         model=str(getattr(agent, "model", "") or ""),
         timeout_seconds=_provider_request_timeout_seconds(agent),
         event_callback=getattr(agent, "event_callback", None),
+        admission_token=admission_token,
+        release_fn=release_fn,
     )
     request_id = str(
         getattr(agent, "_current_api_request_id", "")
@@ -755,11 +823,16 @@ def interruptible_api_call(agent, api_kwargs: dict):
         ProviderRequestStalledError,
     )
 
+    # ── Admission control ─────────────────────────────────────────────
+    admission_token, release_fn = _acquire_admission_token(agent)
+
     request_monitor = ProviderRequestMonitor(
         provider=str(getattr(agent, "provider", "") or ""),
         model=str(getattr(agent, "model", "") or ""),
         timeout_seconds=_provider_request_timeout_seconds(agent),
         event_callback=getattr(agent, "event_callback", None),
+        admission_token=admission_token,
+        release_fn=release_fn,
     )
     request_id = str(
         getattr(agent, "_current_api_request_id", "")
@@ -2670,6 +2743,9 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             ProviderRequestMonitor,
             ProviderRequestStalledError,
         )
+
+        # ── Admission control ─────────────────────────────────────────────
+        admission_token, release_fn = _acquire_admission_token(agent)
         bedrock_monitor = ProviderRequestMonitor(
             provider=str(getattr(agent, "provider", "") or "bedrock"),
             model=str(
@@ -2679,6 +2755,8 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             ),
             timeout_seconds=_provider_request_timeout_seconds(agent),
             event_callback=getattr(agent, "event_callback", None),
+            admission_token=admission_token,
+            release_fn=release_fn,
         )
         bedrock_delivery_lock = threading.RLock()
         bedrock_partial_tool_names: list[str] = []
@@ -3209,11 +3287,15 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         with stream_attempt_lock:
             stream_attempt_state["current"] += 1
             attempt_id = int(stream_attempt_state["current"])
+        # ── Admission control ─────────────────────────────────────────────
+        admission_token, release_fn = _acquire_admission_token(agent)
         monitor = ProviderRequestMonitor(
             provider=str(getattr(agent, "provider", "") or ""),
             model=str(getattr(agent, "model", "") or ""),
             timeout_seconds=_provider_request_timeout_seconds(agent),
             event_callback=getattr(agent, "event_callback", None),
+            admission_token=admission_token,
+            release_fn=release_fn,
         )
         monitor.begin_attempt(
             api_request_id=request_id,
