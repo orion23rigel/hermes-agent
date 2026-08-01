@@ -204,7 +204,7 @@ def resolve_background_endpoint_hash() -> str | None:
 def _read_system_boot_id() -> str:
     """Read the system boot id from /proc."""
     try:
-        with open("/proc/sys/kernel/random/boot_id") as f:
+        with open("/proc/sys/kernel/random/boot_id", encoding="utf-8") as f:
             return f.read().strip()
     except (OSError, IOError):
         return ""
@@ -217,7 +217,7 @@ def _pid_start_time_ms(pid: int) -> int | None:
     Returns None when the PID no longer exists or stat is unreadable.
     """
     try:
-        with open(f"/proc/{pid}/stat") as f:
+        with open(f"/proc/{pid}/stat", encoding="utf-8") as f:
             parts = f.read().split()
         # Field 22 (1-indexed) = starttime in clock ticks
         ticks = int(parts[21])
