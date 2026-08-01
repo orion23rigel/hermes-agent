@@ -149,13 +149,20 @@ class TestInterruptPropagationToChild(unittest.TestCase):
         def run_thread():
             from tools.interrupt import set_interrupt as _set_interrupt_for_test
 
-            agent._execution_thread_id = threading.current_thread().ident
-            _set_interrupt_for_test(False, agent._execution_thread_id)
-            if agent._interrupt_requested:
-                _set_interrupt_for_test(True, agent._execution_thread_id)
-                agent._interrupt_thread_signal_pending = False
-            barrier.wait(timeout=5)
-            result["thread_interrupted"] = is_interrupted()
+            thread_id = threading.current_thread().ident
+            try:
+                agent._execution_thread_id = thread_id
+                _set_interrupt_for_test(False, thread_id)
+                if agent._interrupt_requested:
+                    _set_interrupt_for_test(True, thread_id)
+                    agent._interrupt_thread_signal_pending = False
+                barrier.wait(timeout=5)
+                result["thread_interrupted"] = is_interrupted()
+            finally:
+                # Thread identifiers can be reused immediately after exit.
+                # Do not leak this test's targeted interrupt into a later
+                # worker that happens to receive the same integer ident.
+                _set_interrupt_for_test(False, thread_id)
 
         t = threading.Thread(target=run_thread)
         t.start()
