@@ -16,6 +16,7 @@ Key design decisions:
 
 import asyncio
 import atexit
+import errno
 import json
 import logging
 import os
@@ -937,6 +938,36 @@ def is_malformed_db_error(exc: BaseException) -> bool:
     if not isinstance(exc, sqlite3.DatabaseError):
         return False
     return any(marker in str(exc).lower() for marker in _MALFORMED_SCHEMA_MARKERS)
+
+
+# Markers that mean the host filesystem cannot accept another write. Kept as
+# plain substrings so OSError, sqlite3.OperationalError, and wrapped RPC
+# error strings all match the same helper.
+_DISK_FULL_MARKERS = (
+    "no space left on device",
+    "not enough space",
+    "database or disk is full",  # SQLITE_FULL
+    "disk full",
+    "full disk",
+    "enospc",
+)
+
+
+def is_disk_full_error(exc: BaseException | str | None) -> bool:
+    """True when *exc* (or a stringified error) is a disk-full / ENOSPC failure.
+
+    Covers:
+      * ``OSError`` with ``errno.ENOSPC``
+      * SQLite ``OperationalError: database or disk is full`` (SQLITE_FULL)
+      * Plain English / errno strings that survive RPC wrapping
+    """
+    if exc is None:
+        return False
+    if isinstance(exc, OSError) and getattr(exc, "errno", None) == errno.ENOSPC:
+        return True
+    text = exc if isinstance(exc, str) else str(exc)
+    lowered = text.lower()
+    return any(marker in lowered for marker in _DISK_FULL_MARKERS)
 
 
 def _claim_repair_attempt(db_path: Path) -> bool:
@@ -2374,6 +2405,17 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # Set on the first compression-busy collision so the short wait is
         # measured from then, not from the start of the write.
         compression_deadline: Optional[float] = None
+
+        # Transient engine-level error observed on contended WAL appends
+        # (dual gateway/agent writers; FTS5 trigram sync holds the write
+        # lock). The identical write succeeds standalone, so it is
+        # retryable like locked/busy. The exception CLASS varies with the
+        # SQLite build — some surface it as InterfaceError, which lives
+        # OUTSIDE DatabaseError and escaped the retry net entirely on
+        # attempt 0 — so the check is message-scoped, not class-scoped.
+        def _is_no_more_rows(exc: sqlite3.Error) -> bool:
+            return "no more rows available" in str(exc).lower()
+
         while True:
             try:
                 with self._lock:
@@ -2429,9 +2471,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         "a large WAL checkpoint, or an older pre-update "
                         "process; the database itself is healthy)"
                     ) from exc
-                # Non-lock error — propagate.
+                if _is_no_more_rows(exc) and self._sleep_before_write_retry(deadline, patience_s):
+                    continue
+                # Non-lock error or patience exhausted — propagate.
                 raise
             except sqlite3.DatabaseError as exc:
+                if _is_no_more_rows(exc) and self._sleep_before_write_retry(deadline, patience_s):
+                    continue
                 # Corrupt FTS shadow tables make every write raise the
                 # malformed/corrupt error class through the FTS sync triggers
                 # while the canonical messages table is intact. The gateway
@@ -2444,6 +2490,15 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 if not self._try_runtime_fts_rebuild(exc):
                     raise
                 continue
+            except sqlite3.Error as exc:
+                # Catch-all for builds that surface 'no more rows available'
+                # as InterfaceError (a sibling of DatabaseError, not a
+                # subclass) or another sqlite3.Error class outside the two
+                # handlers above. Message-scoped: anything else propagates
+                # untouched.
+                if _is_no_more_rows(exc) and self._sleep_before_write_retry(deadline, patience_s):
+                    continue
+                raise
 
     def _sleep_before_write_retry(
         self, deadline: float, patience_s: float
@@ -2687,7 +2742,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         model_config: Dict[str, Any] = None,
         system_prompt: str = None,
         user_id: str = None,
-        session_key: str = None,
+        session_key: Optional[str] = None,
         chat_id: str = None,
         chat_type: str = None,
         thread_id: str = None,
@@ -2851,6 +2906,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         thread_id: str = None,
         display_name: str = None,
         origin_json: str = None,
+        include_compression_ancestors: bool = False,
     ) -> None:
         """Persist the gateway routing peer for an existing session row.
 
@@ -2859,18 +2915,43 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         channel directory) can read routing data from state.db instead of
         sessions.json.  They are COALESCE'd only in the sense that ``None``
         leaves the existing value untouched.
+
+        ``include_compression_ancestors`` keeps a logical compression lineage
+        on one routing peer when an explicit gateway resume moves its tip to a
+        different lane. Normal per-turn metadata refreshes update only the
+        supplied row.
         """
         if not session_id or not session_key:
             return
 
         def _do(conn):
-            conn.execute(
-                """UPDATE sessions
-                   SET session_key = ?, source = ?, user_id = ?, chat_id = ?,
-                       chat_type = ?, thread_id = ?,
-                       display_name = COALESCE(?, display_name),
-                       origin_json = COALESCE(?, origin_json)
-                   WHERE id = ?""",
+            lineage_cte = ""
+            target_clause = "WHERE id = ?"
+            query_params = []
+            if include_compression_ancestors:
+                lineage_cte = """
+                    WITH RECURSIVE compression_lineage(id) AS (
+                        SELECT ?
+                        UNION
+                        SELECT parent.id
+                        FROM compression_lineage lineage
+                        JOIN sessions child ON child.id = lineage.id
+                        JOIN sessions parent ON parent.id = child.parent_session_id
+                        WHERE parent.end_reason = 'compression'
+                          AND json_extract(
+                              COALESCE(child.model_config, '{}'),
+                              '$._branched_from'
+                          ) IS NULL
+                          AND json_extract(
+                              COALESCE(child.model_config, '{}'),
+                              '$._delegate_from'
+                          ) IS NULL
+                          AND COALESCE(child.source, '') != 'tool'
+                    )
+                """
+                target_clause = "WHERE id IN (SELECT id FROM compression_lineage)"
+                query_params.append(session_id)
+            query_params.extend(
                 (
                     session_key,
                     source,
@@ -2880,8 +2961,19 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     thread_id,
                     display_name,
                     origin_json,
-                    session_id,
-                ),
+                )
+            )
+            if not include_compression_ancestors:
+                query_params.append(session_id)
+            conn.execute(
+                f"""{lineage_cte}
+                   UPDATE sessions
+                   SET session_key = ?, source = ?, user_id = ?, chat_id = ?,
+                       chat_type = ?, thread_id = ?,
+                       display_name = COALESCE(?, display_name),
+                       origin_json = COALESCE(?, origin_json)
+                   {target_clause}""",
+                query_params,
             )
 
         self._execute_write(_do)
@@ -5074,6 +5166,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         search_query: str = None,
         compact_rows: bool = False,
         include_pinned: bool = False,
+        session_key: str = None,
     ) -> List[Dict[str, Any]]:
         """List sessions with preview (first user message) and last active timestamp.
 
@@ -5121,6 +5214,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         desktop sidebar would render an empty Pinned section. Back-filled rows
         obey the same filters (source, archived, min_message_count) as the
         page: an archived or filtered-out conversation stays out.
+
+        Pass ``session_key`` to restrict results to one stable gateway
+        conversation scope (DM, group, channel, or thread, including the
+        configured per-user isolation policy).
         """
         # Rows carry token/cost totals — drain queued deltas first so
         # listings (sidebar, /resume, dashboards) show exact counters.
@@ -5151,6 +5248,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             placeholders = ",".join("?" for _ in include_sources)
             where_clauses.append(f"s.source IN ({placeholders})")
             params.extend(include_sources)
+        if session_key:
+            where_clauses.append("s.session_key = ?")
+            params.append(session_key)
         if exclude_sources:
             placeholders = ",".join("?" for _ in exclude_sources)
             where_clauses.append(f"s.source NOT IN ({placeholders})")
