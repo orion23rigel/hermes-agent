@@ -801,6 +801,7 @@ def test_worker_spawn_declares_portable_git_mounts(
         skills=[],
         model_override=None,
         provider_override=None,
+        reasoning_effort=None,
         workspace_kind="worktree",
     )
     assert kb._default_spawn(task, str(workspace), board="default") == 43210
