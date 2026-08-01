@@ -472,7 +472,12 @@ class CLIAgentSetupMixin:
                 self._agent_init_exit_code = (
                     KANBAN_PERMANENT_FAILURE_EXIT_CODE
                 )
-            ChatConsole().print(f"[bold red]Failed to initialize agent: {e}[/]")
+            console = ChatConsole()
+            console.print(f"[bold red]Failed to initialize agent: {e}[/]")
+            from hermes_constants import partial_update_hint
+
+            for line in partial_update_hint(e):
+                console.print(line)
             return False
 
     def _preload_resumed_session(self) -> bool:

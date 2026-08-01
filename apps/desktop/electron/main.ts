@@ -189,7 +189,7 @@ import { createStreamThrottle } from './stream-throttle'
 import { nativeOverlayWidth as computeNativeOverlayWidth, macTitleBarOverlayHeight } from './titlebar-overlay-width'
 import { resolveBehindCount, shouldCountCommits } from './update-count'
 import { waitForUpdateClearance } from './update-gate'
-import { readLiveUpdateMarker, writeUpdateMarker } from './update-marker'
+import { readLiveUpdateMarker, updateHandoffConflict, writeUpdateMarker } from './update-marker'
 import { runRebuildWithRetry } from './update-rebuild'
 import {
   buildRelaunchScript,
@@ -2898,6 +2898,19 @@ async function applyUpdates(opts = {}) {
       return { ok: true, manual: true, command, hermesRoot: updateRoot }
     }
 
+    const handoffConflict = updateHandoffConflict(HERMES_HOME)
+
+    if (handoffConflict) {
+      // A different updater already owns the marker — most often a previous
+      // "Update" click whose updater is still alive and parked mid-run.
+      // Spawning another here would overwrite its claim and let two updaters
+      // mutate the checkout at once (#75778); refuse instead.
+      rememberLog(`[updates] refusing hand-off: ${handoffConflict.message}`)
+      emitUpdateProgress({ stage: 'error', message: handoffConflict.message, percent: null })
+
+      return { ok: false, error: 'update-already-running', message: handoffConflict.message }
+    }
+
     emitUpdateProgress({
       stage: 'restart',
       message:
@@ -3029,6 +3042,24 @@ async function handOffWindowsBootstrapRecovery(reason) {
 
   if (!updater) {
     return false
+  }
+
+  const handoffConflict = updateHandoffConflict(HERMES_HOME)
+
+  if (handoffConflict) {
+    // Same hazard as applyUpdates (#75778): a live foreign updater already
+    // owns the marker. Spawning another here would overwrite its claim and
+    // race a second updater over the same install tree. The live updater
+    // is already working on this exact install and will restart us when
+    // it finishes, so treat this the same as a successful hand-off instead
+    // of clobbering it with our own.
+    rememberLog(`[bootstrap] refusing recovery hand-off: ${handoffConflict.message}`)
+    isQuittingForHandoff = true
+    setTimeout(() => {
+      app.quit()
+    }, UPDATE_HANDOFF_DWELL_MS)
+
+    return true
   }
 
   const updateRoot = resolveUpdateRoot()

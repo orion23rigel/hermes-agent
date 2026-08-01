@@ -1863,6 +1863,9 @@ def compress_context(
         _compression_used_fallback = bool(
             getattr(agent.context_compressor, "_last_summary_fallback_used", False)
         )
+        _compression_feasibility_skip = bool(
+            getattr(agent.context_compressor, "_last_feasibility_skip", False)
+        )
 
         # If compression aborted (aux LLM failed to produce a usable summary)
         # the compressor returns the input messages unchanged.  Surface the
@@ -2373,6 +2376,7 @@ def compress_context(
                 record_boundary(
                     agent.context_compressor,
                     used_fallback=_compression_used_fallback,
+                    feasibility_skip=_compression_feasibility_skip,
                 )
             else:
                 agent.context_compressor._verify_compaction_cleared_threshold = True
