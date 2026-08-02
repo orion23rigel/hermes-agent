@@ -1911,6 +1911,35 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     isolation_level=None,
                 )
                 self._conn.row_factory = sqlite3.Row
+                # FTS capability flags normally come from writable schema
+                # initialisation. Probe existing virtual tables with SELECTs
+                # only so read-only search keeps its FTS and trigram paths.
+                # Close the connection on ANY probe failure (e.g. malformed
+                # schema raises DatabaseError, not the OperationalError the
+                # probe handles): the outer except re-raises without cleanup,
+                # and a leaked tracked connection blocks _backup_db_file's
+                # raw-copy for the rest of the process — the writable heal
+                # that follows would then repair WITHOUT its forensic backup.
+                try:
+                    cursor = self._conn.cursor()
+                    self._fts_enabled = (
+                        self._fts_table_probe(cursor, "messages_fts") is True
+                    )
+                    if self._fts_enabled:
+                        self._trigram_available = (
+                            self._fts_table_probe(
+                                cursor,
+                                "messages_fts_trigram",
+                            )
+                            is True
+                        )
+                except BaseException:
+                    conn, self._conn = self._conn, None
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                    raise
                 return
 
             self.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -2627,8 +2656,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         """Close the database connection.
 
         Drains queued token deltas first (the background writer needs the
-        connection), then attempts a TRUNCATE WAL checkpoint so that
-        exiting processes help shrink the WAL file.
+        connection). Writable connections then attempt a TRUNCATE WAL
+        checkpoint so exiting writer processes help shrink the WAL file.
+        Read-only connections never request a checkpoint.
         """
         self._stop_token_writer()
         # The atexit hook holds a strong reference to this instance (bound
@@ -2656,10 +2686,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         self._read_local.conn = None
         with self._lock:
             if self._conn:
-                try:
-                    self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-                except Exception as exc:
-                    logger.debug("WAL checkpoint (TRUNCATE) at close failed: %s", exc)
+                if not self.read_only:
+                    try:
+                        self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                    except Exception as exc:
+                        logger.debug(
+                            "WAL checkpoint (TRUNCATE) at close failed: %s",
+                            exc,
+                        )
                 self._conn.close()
                 self._conn = None
 
@@ -8529,12 +8563,16 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         min_interval_hours: int = 24,
         vacuum: bool = True,
         sessions_dir: Optional[Path] = None,
+        min_vacuum_interval_days: int = 30,
     ) -> Dict[str, Any]:
         """Idempotent auto-maintenance: prune inactive sessions + optional VACUUM.
 
         Records the last run timestamp in state_meta so subsequent calls
-        within ``min_interval_hours`` no-op. Designed to be called once at
-        startup from long-lived entrypoints (CLI, gateway, cron scheduler).
+        within ``min_interval_hours`` no-op. VACUUM has its own, typically
+        longer, throttle controlled by ``min_vacuum_interval_days`` so routine
+        pruning does not repeatedly rewrite the database. Designed to be
+        called once at startup from long-lived entrypoints (CLI, gateway, cron
+        scheduler).
 
         When *sessions_dir* is provided, on-disk transcript files
         (``.json`` / ``.jsonl`` / ``request_dump_*``) for pruned sessions
@@ -8569,12 +8607,25 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
             result["pruned"] = pruned
 
-            # Only VACUUM if we actually freed rows — VACUUM on a tight DB
-            # is wasted I/O. Threshold keeps small DBs from paying the cost.
-            if vacuum and pruned > 0:
+            # Only VACUUM if we actually freed rows, and no more often than
+            # once every min_vacuum_interval_days -- a large prune (e.g. the
+            # first one to cross retention_days on a DB with tens of
+            # thousands of rows) can free enough pages that pruned > 0 fires
+            # on every subsequent startup even though a VACUUM already ran
+            # recently. VACUUM on this DB's size (FTS5 shadow tables) is not
+            # cheap -- it holds an exclusive lock for the full rewrite.
+            last_vacuum_raw = self.get_meta("last_vacuum")
+            vacuum_due = True
+            if last_vacuum_raw:
+                try:
+                    vacuum_due = (now - float(last_vacuum_raw)) >= min_vacuum_interval_days * 86400
+                except (TypeError, ValueError):
+                    vacuum_due = True
+            if vacuum and pruned > 0 and vacuum_due:
                 try:
                     self.vacuum()
                     result["vacuumed"] = True
+                    self.set_meta("last_vacuum", str(now))
                 except Exception as exc:
                     logger.warning("state.db VACUUM failed: %s", exc)
 
