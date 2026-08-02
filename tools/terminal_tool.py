@@ -2386,6 +2386,16 @@ def terminal_tool(
                 )
             cwd = config["cwd"]
         default_timeout = config["timeout"]
+
+        # Validate an explicit timeout before it flows into deadline math.
+        # ``timeout or default`` silently turns 0 into the default (0 can't mean
+        # "no timeout" here), and a negative value is truthy so it would sail
+        # through to ``deadline = now + timeout`` and fire an immediate,
+        # nonsensical "-Ns" timeout. Reject non-positive values outright.
+        if timeout is not None and timeout <= 0:
+            return tool_error(
+                f"timeout must be a positive number of seconds (got {timeout})."
+            )
         effective_timeout = timeout or default_timeout
 
         # Reject foreground commands where the model explicitly requests
@@ -3006,7 +3016,13 @@ def terminal_tool(
             # session — record it under the session key so the durable record
             # never depends on the shared env surviving or on who drives the
             # env next.
-            record_session_cwd(session_key, getattr(env, "cwd", None))
+            #
+            # BUT: a per-command ``workdir`` override is transient by contract
+            # (docstring: "Working directory for this command"). Recording it
+            # would hijack the session's durable cwd for every later command
+            # that doesn't pass ``workdir``. Skip the dual-write in that case.
+            if not workdir:
+                record_session_cwd(session_key, getattr(env, "cwd", None))
 
             # Extract output
             output = result.get("output", "")
