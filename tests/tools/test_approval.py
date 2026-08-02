@@ -1147,11 +1147,25 @@ class TestApprovalTimeoutIsNotConsent:
         os.environ.pop("HERMES_CRON_SESSION", None)
         os.environ["HERMES_GATEWAY_SESSION"] = "1"
         os.environ["HERMES_SESSION_KEY"] = self.SESSION_KEY
+        # Env alone does NOT pin the session key. get_current_session_key()
+        # resolves through gateway.session_context.get_session_env(), which
+        # returns the context variable whenever it has been *explicitly* bound
+        # -- including the empty string that clear_session_vars() writes -- and
+        # deliberately does not fall back to os.environ in that case. Any test
+        # that ran set_session_vars()/clear_session_vars() earlier in this
+        # process (e.g. tests/tools/test_cron_approval_mode.py) therefore leaves
+        # _SESSION_KEY bound to "" for the rest of the pytest context, so the
+        # notify_cb registered below under SESSION_KEY would never be found and
+        # the guard would fall through to the no-callback pending path. Bind the
+        # approval contextvar too so this class pins the session key on the same
+        # channel production reads it from, regardless of test ordering.
+        self._session_token = mod.set_current_session_key(self.SESSION_KEY)
 
     def teardown_method(self):
         from tools import approval as mod
         mod._gateway_queues.clear()
         mod._gateway_notify_cbs.clear()
+        mod.reset_current_session_key(self._session_token)
         for k, v in self._saved_env.items():
             if v is None:
                 os.environ.pop(k, None)
