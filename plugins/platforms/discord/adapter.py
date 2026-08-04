@@ -26,13 +26,34 @@ import time
 from collections import defaultdict
 from contextlib import suppress
 from typing import Callable, Dict, List, Optional, Any, Tuple
-from urllib.parse import urljoin
+from urllib.parse import quote, urljoin
 
 from agent.async_utils import (
     consume_detached_task_result as _consume_background_task_result,
 )
+from agent.display import ToolPreview
 
 logger = logging.getLogger(__name__)
+
+_DISCORD_MARKDOWN_LINK_LABEL_RE = re.compile(r"([\\\[\]])")
+_DISCORD_URL_LABEL_SCHEME_RE = re.compile(r"^https?://", re.IGNORECASE)
+
+
+def _format_discord_markdown_link(label: str, url: str) -> str:
+    """Return a Discord Markdown link whose label is not itself a URL.
+
+    Discord gives URL-shaped link labels their own link behavior. A truncated
+    URL label can therefore win over the Markdown destination and remain a
+    broken link. Dropping only the scheme keeps the preview recognizable while
+    leaving one unambiguous click target.
+
+    The destination is wrapped in angle brackets (``<url>``) so Discord does
+    not unfurl an OG-preview embed under every tool progress bubble.
+    """
+    label = _DISCORD_URL_LABEL_SCHEME_RE.sub("", label, count=1)
+    escaped_label = _DISCORD_MARKDOWN_LINK_LABEL_RE.sub(r"\\\1", label)
+    escaped_url = quote(url, safe=":/?#[]@!$&'*+,;=%")
+    return f"[{escaped_label}](<{escaped_url}>)"
 
 
 class _Snowflake:
@@ -97,7 +118,6 @@ _DISCORD_NONCONVERSATIONAL_HISTORY_MESSAGE_PATTERNS = (
     ),
     re.compile(r"^\s*♻️?\s+Gateway\s+(?:restarted successfully|online\b)[\s\S]*$", re.IGNORECASE),
 )
-
 try:
     import discord
     from discord import Message as DiscordMessage, Intents
@@ -121,7 +141,11 @@ except ImportError:
 
 from gateway.config import Platform, PlatformConfig
 
-from gateway.platforms.helpers import MessageDeduplicator, ThreadParticipationTracker, convert_table_to_bullets
+from gateway.platforms.helpers import (
+    MessageDeduplicator,
+    ThreadParticipationTracker,
+    convert_table_to_bullets,
+)
 from utils import atomic_json_write, env_float, env_int
 from gateway.platforms.base import (
     BasePlatformAdapter,
@@ -838,34 +862,37 @@ class VoiceReceiver:
     @staticmethod
     def pcm_to_wav(pcm_data: bytes, output_path: str,
                    src_rate: int = 48000, src_channels: int = 2):
-        """Convert raw PCM to 16kHz mono WAV via ffmpeg."""
-        with tempfile.NamedTemporaryFile(suffix=".pcm", delete=False) as f:
-            f.write(pcm_data)
-            pcm_path = f.name
-        try:
-            from hermes_cli._subprocess_compat import windows_hide_flags
+        """Convert raw PCM to 16kHz mono WAV via ffmpeg.
 
-            subprocess.run(
-                [
-                    resolve_ffmpeg_executable(), "-y", "-loglevel", "error",
-                    "-f", "s16le",
-                    "-ar", str(src_rate),
-                    "-ac", str(src_channels),
-                    "-i", pcm_path,
-                    "-ar", "16000",
-                    "-ac", "1",
-                    output_path,
-                ],
-                check=True,
-                timeout=10,
-                stdin=subprocess.DEVNULL,
-                creationflags=windows_hide_flags(),
-            )
-        finally:
-            try:
-                os.unlink(pcm_path)
-            except OSError:
-                pass
+        The PCM is fed straight to ffmpeg's stdin, which avoids staging it in a
+        temp file on every utterance. The WAV is still written to *output_path*
+        rather than captured from stdout: ffmpeg cannot seek on a pipe, so a
+        piped WAV carries placeholder (0xFFFFFFFF) RIFF/data sizes that make
+        strict readers misreport the length.
+        """
+        from hermes_cli._subprocess_compat import windows_hide_flags
+
+        subprocess.run(
+            [
+                resolve_ffmpeg_executable(), "-y", "-loglevel", "error",
+                "-f", "s16le",
+                "-ar", str(src_rate),
+                "-ac", str(src_channels),
+                "-i", "pipe:0",
+                "-ar", "16000",
+                "-ac", "1",
+                output_path,
+            ],
+            input=pcm_data,
+            check=True,
+            timeout=10,
+            # Capture ffmpeg's -loglevel error output so a failure's
+            # CalledProcessError carries the actual message (parity with
+            # tools/transcription_tools' ffmpeg call sites) instead of
+            # "returned non-zero exit status N" with stderr detached.
+            stderr=subprocess.PIPE,
+            creationflags=windows_hide_flags(),
+        )
 
 
 def _read_dm_role_auth_guild() -> Optional[int]:
@@ -973,6 +1000,13 @@ class DiscordAdapter(BasePlatformAdapter):
     # a hard two-minute ceiling.
     PLAYBACK_TIMEOUT = 120
     PLAYBACK_TIMEOUT_PADDING = 30
+
+    def format_tool_preview(self, preview: ToolPreview) -> str:
+        """Keep a truncated URL preview clickable in Discord markdown."""
+        if not preview.url:
+            return preview.text
+
+        return _format_discord_markdown_link(preview.text, preview.url)
 
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.DISCORD)
@@ -1739,6 +1773,19 @@ class DiscordAdapter(BasePlatformAdapter):
         # Cancel the liveness probe first so it can't fire a spurious fatal
         # error / reconnect while we're intentionally tearing the adapter down.
         await self._cancel_liveness_task()
+        # Clean up all active voice connections *before* cancelling the bot task.
+        # leave_voice_channel() ends in `await vc.disconnect()`, and discord.py's
+        # VoiceClient.disconnect() sends a voice state update over the main
+        # gateway websocket and then waits for the voice socket to close.  The
+        # bot task is the loop running that gateway connection, so cancelling it
+        # first leaves the handshake with no transport: it can never complete and
+        # blocks until the caller's shutdown timeout fires.
+        for guild_id in list(self._voice_clients.keys()):
+            try:
+                await self.leave_voice_channel(guild_id)
+            except Exception as e:  # pragma: no cover - defensive logging
+                logger.debug("[%s] Error leaving voice channel %s: %s", self.name, guild_id, e)
+
         # Cancel the bot task before closing the client.  If connect() timed out
         # and returned False, the background client.start() task may still be
         # running; calling client.close() alone is not enough to stop it because
@@ -1746,12 +1793,6 @@ class DiscordAdapter(BasePlatformAdapter):
         # WebSocket handshake is in flight.  Explicitly cancelling the task here
         # ensures the zombie client cannot receive or dispatch any further events.
         await self._cancel_bot_task()
-        # Clean up all active voice connections before closing the client
-        for guild_id in list(self._voice_clients.keys()):
-            try:
-                await self.leave_voice_channel(guild_id)
-            except Exception as e:  # pragma: no cover - defensive logging
-                logger.debug("[%s] Error leaving voice channel %s: %s", self.name, guild_id, e)
 
         if self._client:
             try:
@@ -4481,7 +4522,18 @@ class DiscordAdapter(BasePlatformAdapter):
                     transcript=transcript,
                 )
         except Exception as e:
-            logger.warning("Voice input processing failed: %s", e, exc_info=True)
+            # CalledProcessError from pcm_to_wav carries ffmpeg's captured
+            # stderr — surface it, or the log only says "exit status N".
+            _ff_err = getattr(e, "stderr", None)
+            if _ff_err:
+                if isinstance(_ff_err, bytes):
+                    _ff_err = _ff_err.decode("utf-8", "replace")
+                logger.warning(
+                    "Voice input processing failed: %s (ffmpeg: %s)",
+                    e, _ff_err.strip(), exc_info=True,
+                )
+            else:
+                logger.warning("Voice input processing failed: %s", e, exc_info=True)
         finally:
             try:
                 os.unlink(wav_path)
@@ -9486,7 +9538,14 @@ async def _standalone_send(
     except ImportError:
         return {"error": "aiohttp not installed. Run: pip install aiohttp"}
 
-    token = (getattr(pconfig, "token", None) or os.getenv("DISCORD_BOT_TOKEN", "")).strip()
+    token = (getattr(pconfig, "token", None) or "").strip()
+    if not token:
+        # Profile-scoped read: under multiplex the process env may hold a
+        # different profile's bot token, so honor the secret scope's verdict
+        # (scoped miss ⇒ no token; unscoped multiplex ⇒ UnscopedSecretError).
+        from agent.secret_scope import get_secret
+
+        token = (get_secret("DISCORD_BOT_TOKEN", "") or "").strip()
     if not token:
         return {"error": "Discord standalone send: DISCORD_BOT_TOKEN is not set"}
 
