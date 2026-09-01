@@ -5486,9 +5486,21 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self.disabled_toolsets = parse_config_string_list(CLI_CONFIG["agent"].get("disabled_toolsets"))
 
         if toolsets and "all" not in toolsets and "*" not in toolsets:
+            # Plugin toolsets are registered during plugin discovery, but the
+            # CLI constructor runs before the normal model-tool initialization
+            # path. Discover them here too, so valid bundled/user plugins are
+            # not reported as unknown during startup. Discovery is best-effort;
+            # genuinely unknown names must still fail closed below.
+            try:
+                from hermes_cli.plugins import discover_plugins
+
+                discover_plugins()
+            except Exception:
+                logger.debug("Early CLI plugin discovery failed", exc_info=True)
+
             # Validate each toolset — MCP server names are resolved via
             # live registry aliases (registered during discover_mcp_tools),
-            # but discovery hasn't run yet at this point, so exclude them.
+            # so keep the explicit MCP-name exception as well.
             mcp_names = set((CLI_CONFIG.get("mcp_servers") or {}).keys())
             invalid = [t for t in toolsets if not validate_toolset(t) and t not in mcp_names]
             if invalid:

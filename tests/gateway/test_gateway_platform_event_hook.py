@@ -143,6 +143,39 @@ class TestRunnerDispatch:
 
         invoke.assert_called_once_with("gateway_platform_event", **event)
 
+    def test_authorized_message_created_gets_trusted_wayweave_metadata(self):
+        runner = object.__new__(GatewayRunner)
+        runner._is_user_authorized = lambda source: source.user_id == "777"
+        runner._active_profile_name = lambda: "wayweave-bot"
+        invoke = MagicMock()
+        source = SimpleNamespace(user_id="777", profile="wayweave-bot")
+        event = {
+            "platform": "discord",
+            "event_type": "message_created",
+            "payload": {
+                "chat_id": "555",
+                "message_id": "456",
+                "thread_id": "888",
+                "author_id": "777",
+                "text": "hello",
+                "created_at": "2026-08-21T00:00:00+00:00",
+            },
+        }
+
+        with patch("hermes_cli.lifecycle.invoke_hook", invoke):
+            asyncio.run(runner._handle_gateway_platform_event(event, source))
+
+        payload = invoke.call_args.kwargs["payload"]
+        assert payload["schema_version"] == 1
+        assert payload["native_message_id"] == "456"
+        assert payload["profile_identity"] == "wayweave-bot"
+        assert payload["event_id"] == "discord:456"
+        assert payload["gateway_delivery_evidence"] == {
+            "authorized": True,
+            "trusted_gateway_delivery": True,
+            "source_classification": "discord-human",
+        }
+
     def test_unauthorized_event_never_reaches_hooks(self):
         runner = object.__new__(GatewayRunner)
         runner._is_user_authorized = lambda source: False

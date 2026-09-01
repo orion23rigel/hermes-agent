@@ -138,6 +138,71 @@ def _capture(a):
     return seen
 
 
+class TestMessageCreated:
+    def test_message_created_normalized_and_fired(self):
+        a = _adapter()
+        seen = _capture(a)
+
+        asyncio.run(a._on_platform_message_create(_message()))
+
+        assert len(seen) == 1
+        event, source = seen[0]
+        assert event == {
+            "platform": "discord",
+            "event_type": "message_created",
+            "payload": {
+                "chat_id": "555",
+                "message_id": "456",
+                "thread_id": None,
+                "author_id": "777",
+                "text": "hello world",
+                "created_at": None,
+                "guild_id": "999",
+            },
+        }
+        json.dumps(event)
+        assert source.user_id == "777"
+        assert source.chat_id == "555"
+
+    def test_message_created_reaches_profile_handler_when_global_hook_probe_is_false(self, monkeypatch):
+        a = _adapter()
+        seen = _capture(a)
+        monkeypatch.setattr("hermes_cli.lifecycle.has_hook", lambda _name: False)
+
+        asyncio.run(a._on_platform_message_create(_message()))
+
+        assert len(seen) == 1
+        assert seen[0][0]["event_type"] == "message_created"
+
+    def test_message_created_in_thread_carries_thread_id(self):
+        a = _adapter()
+        seen = _capture(a)
+
+        asyncio.run(a._on_platform_message_create(_message(chan=_channel(chan_id=888, thread=True))))
+
+        event, source = seen[0]
+        assert event["payload"]["thread_id"] == "888"
+        assert event["payload"]["chat_id"] == "888"
+        assert source.thread_id == "888"
+
+    def test_bot_authored_message_dropped(self):
+        a = _adapter()
+        seen = _capture(a)
+
+        asyncio.run(a._on_platform_message_create(_message(bot=True)))
+
+        assert seen == []
+
+    def test_message_created_requires_identifiers(self):
+        a = _adapter()
+        seen = _capture(a)
+        malformed = _message(message_id=None)
+
+        asyncio.run(a._on_platform_message_create(malformed))
+
+        assert seen == []
+
+
 class TestMessageEdited:
     def test_edit_normalized_and_fired(self):
         a = _adapter()

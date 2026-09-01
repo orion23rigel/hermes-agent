@@ -428,6 +428,24 @@ async def test_auto_create_thread_strips_mention_syntax_from_name(adapter):
 
 
 @pytest.mark.asyncio
+async def test_auto_create_thread_reuses_fallback_seed_on_retry(adapter):
+    """A failed fallback retry must not post duplicate visible seed messages."""
+    seed = SimpleNamespace(create_thread=AsyncMock(side_effect=RuntimeError("rate limited")))
+    message = SimpleNamespace(
+        content="please help",
+        create_thread=AsyncMock(side_effect=RuntimeError("rate limited")),
+        channel=SimpleNamespace(send=AsyncMock(return_value=seed)),
+        author=SimpleNamespace(display_name="Jezza"),
+    )
+
+    result = await adapter._auto_create_thread(message)
+
+    assert result is None
+    message.channel.send.assert_awaited_once()
+    assert seed.create_thread.await_count == 2
+
+
+@pytest.mark.asyncio
 async def test_rename_thread_edits_only_when_current_name_matches(adapter):
     thread = SimpleNamespace(
         id=999,

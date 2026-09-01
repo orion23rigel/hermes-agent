@@ -708,15 +708,47 @@ Disabling the size cap (`max_attachment_bytes: 0`) means a user can drop a multi
 
 ## Interactive Prompts (clarify)
 
-When the agent calls the `clarify` tool — to ask which approach you prefer, get post-task feedback, or check before a non-trivial decision — Discord renders the question with **one button per choice**:
+Discord's clarify presentation is configurable with the plugin-specific setting:
+
+```yaml
+platforms:
+  discord:
+    extra:
+      clarify_mode: text
+```
+
+The default is `buttons`, which preserves the existing interactive behavior. In
+`text` mode, Hermes never attaches Discord buttons to a `clarify` prompt.
+Open-ended prompts remain ordinary text prompts:
+
+> What should we improve?
+>
+> Reply in this channel with your answer.
+
+Preset-choice prompts are rendered as numbered text:
 
 > Which framework should I use for the dashboard?
 >
-> [1. Next.js] [2. Remix] [3. Astro] [Other (type answer)]
+> 1. Next.js
+> 2. Remix
+> 3. Astro
+>
+> Reply with the number.
 
-Click a numbered button to answer, or click **Other** to type a free-form response (the next message you send in that channel becomes the answer). Open-ended `clarify` calls (no preset choices) skip the buttons and just capture your next message.
+For preset choices, use a valid number (or the existing exact choice-text
+behavior). Invalid, out-of-range, negative, or mixed responses such as `1, but
+I would also like...` are not combined into a choice plus extra guidance.
+Arbitrary prose is guaranteed only for open-ended prompts; text mode does not
+add an `Other` free-response path for preset choices.
 
-The buttons disable themselves once a choice is made so duplicate clicks don't double-resolve the prompt. Configure the response timeout via `agent.clarify_timeout` in `~/.hermes/config.yaml` (default `600` seconds). If you don't respond within the timeout, the agent unblocks with a sentinel message and adapts rather than hanging.
+Invalid or unknown `clarify_mode` values fall back to `buttons`. This setting
+affects only Discord `clarify` prompts; approval, confirmation, update, and
+other interactive Discord views are unchanged.
+
+Hermes waits up to `agent.clarify_timeout` for a response (default `3600`
+seconds). Text mode has no Discord button expiration because it creates no
+button view. No reminder notification is sent by this feature. Responses after
+the existing clarify timeout do not resolve the expired prompt.
 
 ## Home Channel
 

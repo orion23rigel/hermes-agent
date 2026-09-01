@@ -17228,6 +17228,46 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return
             if not self._is_user_authorized_for_source(source):
                 return
+            if event.get("event_type") == "message_created":
+                raw_payload = event.get("payload")
+                if not isinstance(raw_payload, dict):
+                    return
+                payload = dict(raw_payload)
+                message_id = str(payload.get("message_id") or "").strip()
+                chat_id = str(payload.get("chat_id") or "").strip()
+                author_id = str(payload.get("author_id") or "").strip()
+                text = payload.get("text")
+                if not message_id or not chat_id or not author_id or not isinstance(text, str):
+                    return
+                thread_id = payload.get("thread_id")
+                thread_id = str(thread_id).strip() if thread_id else None
+                occurred_at = payload.get("created_at")
+                occurred_at = (
+                    str(occurred_at).strip()
+                    if isinstance(occurred_at, str) and occurred_at.strip()
+                    else datetime.now(timezone.utc).isoformat()
+                )
+                payload.update({
+                    "schema_version": 1,
+                    "native_message_id": message_id,
+                    "channel_id": chat_id,
+                    "thread_id": thread_id,
+                    "profile_identity": getattr(source, "profile", None) or self._active_profile_name(),
+                    "author_kind": "human",
+                    "is_bot": False,
+                    "internal": False,
+                    "event_id": f"discord:{message_id}",
+                    "correlation_id": f"discord:{chat_id}:{thread_id or chat_id}",
+                    "source_classification": "discord-human",
+                    "occurred_at": occurred_at,
+                    "received_at": datetime.now(timezone.utc).isoformat(),
+                    "gateway_delivery_evidence": {
+                        "authorized": True,
+                        "trusted_gateway_delivery": True,
+                        "source_classification": "discord-human",
+                    },
+                })
+                event = {**event, "payload": payload}
             invoke_hook("gateway_platform_event", **event)
         except Exception:
             # Observer failures must never break the adapter's update loop.

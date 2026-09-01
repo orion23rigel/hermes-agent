@@ -1406,6 +1406,7 @@ class DiscordAdapter(BasePlatformAdapter):
             @self._client.event
             async def on_message(message: DiscordMessage):
                 await adapter_self._dispatch_discord_message(message)
+                await adapter_self._on_platform_message_create(message)
 
             @self._client.event
             async def on_message_edit(before: DiscordMessage, after: DiscordMessage):
@@ -1720,6 +1721,59 @@ class DiscordAdapter(BasePlatformAdapter):
             return has_hook("gateway_platform_event")
         except Exception:
             return False
+
+    async def _on_platform_message_create(self, message) -> None:
+        """Normalize an authorized Discord message for observer plugins.
+
+        Do not gate this fire-site with the process-global lifecycle manager:
+        multiplexed profile handlers may register on a profile-scoped manager.
+        The gateway-owned handler performs the authoritative scoped hook check.
+        """
+        try:
+            author = getattr(message, "author", None)
+            if author is None or getattr(author, "bot", False):
+                return
+            thread_id, chat_id = self._thread_id_and_chat_for_channel(
+                getattr(message, "channel", None)
+            )
+            message_id = getattr(message, "id", None)
+            author_id = getattr(author, "id", None)
+            if chat_id is None or message_id is None or author_id is None:
+                return
+            guild = getattr(message, "guild", None)
+            created_at = getattr(message, "created_at", None)
+            text = getattr(message, "content", None)
+            event = {
+                "platform": "discord",
+                "event_type": "message_created",
+                "payload": {
+                    "chat_id": str(chat_id)[:128],
+                    "message_id": str(message_id)[:128],
+                    "thread_id": thread_id[:128] if thread_id else None,
+                    "author_id": str(author_id)[:128],
+                    "text": text[:8192] if isinstance(text, str) else "",
+                    "created_at": (
+                        str(created_at.isoformat())[:64]
+                        if created_at is not None and hasattr(created_at, "isoformat")
+                        else None
+                    ),
+                    "guild_id": str(getattr(guild, "id", ""))[:128] if guild else None,
+                },
+            }
+            source = self._source_for_platform_event(
+                chat_id=str(chat_id),
+                user_id=str(author_id),
+                user_name=getattr(author, "display_name", None),
+                thread_id=thread_id,
+                guild_id=str(getattr(guild, "id", "")) if guild else None,
+                message_id=str(message_id),
+            )
+        except Exception:
+            logger.debug(
+                "[%s] message_created normalize error", self.name, exc_info=True,
+            )
+            return
+        await self._fire_platform_event(event, source)
 
     async def _on_platform_message_edit(self, before, after) -> None:
         """Normalize ``on_message_edit`` into event_type ``message_edited``."""
@@ -7269,6 +7323,10 @@ class DiscordAdapter(BasePlatformAdapter):
 
         last_direct_error: Exception | None = None
         last_fallback_error: Exception | None = None
+        # A fallback seed message is an external side effect.  If creating the
+        # thread from that seed fails, retries must reuse the same message
+        # rather than posting another visible seed into the channel.
+        fallback_seed_msg: Any | None = None
 
         for attempt in range(2):
             try:
@@ -7281,10 +7339,11 @@ class DiscordAdapter(BasePlatformAdapter):
             except Exception as direct_error:
                 last_direct_error = direct_error
                 try:
-                    seed_msg = await message.channel.send(
-                        f"\U0001f9f5 Thread created by Hermes: **{thread_name}**"
-                    )
-                    thread = await seed_msg.create_thread(
+                    if fallback_seed_msg is None:
+                        fallback_seed_msg = await message.channel.send(
+                            f"\U0001f9f5 Thread created by Hermes: **{thread_name}**"
+                        )
+                    thread = await fallback_seed_msg.create_thread(
                         name=thread_name,
                         auto_archive_duration=1440,
                         reason=reason,
@@ -7633,6 +7692,13 @@ class DiscordAdapter(BasePlatformAdapter):
         except Exception as e:
             return SendResult(success=False, error=str(e))
 
+    def _clarify_mode(self) -> str:
+        """Return the validated Discord clarify presentation mode."""
+        extra = getattr(self.config, "extra", {})
+        raw = extra.get("clarify_mode", "buttons") if isinstance(extra, dict) else "buttons"
+        mode = raw.strip().lower() if isinstance(raw, str) else ""
+        return mode if mode in {"buttons", "text"} else "buttons"
+
     async def send_clarify(
         self,
         chat_id: str,
@@ -7642,7 +7708,7 @@ class DiscordAdapter(BasePlatformAdapter):
         session_key: str,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        """Render a clarify prompt with one Discord button per choice.
+        """Render a clarify prompt according to the Discord presentation mode.
 
         Multi-choice mode (``choices`` non-empty): renders a button per option
         plus a final "✏️ Other (type answer)" button. Picking "Other" flips
@@ -7717,11 +7783,43 @@ class DiscordAdapter(BasePlatformAdapter):
             clean_choices = [
                 s for s in (_flatten_choice(c) for c in (choices or [])) if s
             ]
-            # Discord allows up to 5 buttons per row, 5 rows per view = 25.
-            # We reserve one slot for the "Other" button, so cap at 24 choices.
-            clean_choices = clean_choices[:24]
+            text_mode = self._clarify_mode() == "text"
 
-            if clean_choices:
+            # Keep the existing 24-choice cap so button-mode behavior and the
+            # gateway's established numbered range remain stable.
+            clean_choices = clean_choices[:24]
+            numbered = "\n".join(
+                f"{index}. {choice}"
+                for index, choice in enumerate(clean_choices, start=1)
+            )
+
+            if clean_choices and text_mode:
+                # The plain Discord content limit is 2000 characters. Keep the
+                # question and reply instruction visible, and trim only the
+                # numbered list when long choice labels would overflow it.
+                content_header = "❓ **Hermes needs your input**\n\n"
+                reply_instruction = "\n\nReply with the number."
+                choice_budget = max(
+                    0,
+                    self.MAX_MESSAGE_LENGTH
+                    - len(content_header)
+                    - len(str(question or "").strip())
+                    - len(reply_instruction),
+                )
+                if len(numbered) > choice_budget:
+                    omitted = "\n... [additional choices omitted]"
+                    if choice_budget < len(omitted):
+                        numbered = omitted[:choice_budget]
+                    else:
+                        keep = choice_budget - len(omitted)
+                        numbered = numbered[:keep].rsplit("\n", 1)[0] + omitted
+                embed.add_field(
+                    name="Choices",
+                    value=numbered[:1021] + "..." if len(numbered) > 1024 else numbered,
+                    inline=False,
+                )
+                view = None
+            elif clean_choices:
                 embed.add_field(
                     name="Choices",
                     value="Pick one below, or click ✏️ Other to type a custom answer.",
@@ -7743,11 +7841,12 @@ class DiscordAdapter(BasePlatformAdapter):
 
             # Mirror the question in plain content — embeds are invisible on
             # some clients (see send_exec_approval).
-            clarify_tail = (
-                "\n\nPick one below, or click ✏️ Other to type a custom answer."
-                if clean_choices
-                else "\n\nReply in this channel with your answer."
-            )
+            if clean_choices and text_mode:
+                clarify_tail = "\n\n" + numbered + "\n\nReply with the number."
+            elif clean_choices:
+                clarify_tail = "\n\nPick one below, or click ✏️ Other to type a custom answer."
+            else:
+                clarify_tail = "\n\nReply in this channel with your answer."
             content = self._self_contained_prompt_content(
                 "❓ **Hermes needs your input**", str(question or "").strip(),
                 tail=clarify_tail,
